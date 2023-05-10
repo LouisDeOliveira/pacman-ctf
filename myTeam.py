@@ -14,6 +14,7 @@
 
 import random
 import time
+from typing import List
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -134,18 +135,29 @@ class NNTrainingAgent(CaptureAgent):
         true_action = self.action_masking(action, gameState)  # action number
         final_action = self.action_names[true_action.item()]  # action name
 
-        print(f"food reward: {self.eat_food_reward(gameState, self.last_turn_state)}")
+        # print(f"food reward: {self.eat_food_reward(gameState, self.last_turn_state)}")
 
         # print(f"score diff reward: {self.score_diff_reward(gameState, next_state)}")
-        print(
-            f"eaten food reward: {self.food_eaten_reward(gameState, self.last_turn_state)}"
-        )
-
+        # print(
+        #     f"eaten food reward: {self.food_eaten_reward(gameState, self.last_turn_state)}"
+        # )
+        # print(gameState.getAgentDistances())
         self.checkDeath(gameState, self.index)
 
         # update the last known state
         self.last_turn_state = gameState
         return final_action
+
+    def make_food_matrix(self, gameState: GameState):
+        """
+        Converts food data into numpy array.
+        """
+        food = np.array(self.getFood(gameState).data).astype(np.float32)
+        ownfood = np.array(self.getFoodYouAreDefending(gameState).data).astype(
+            np.float32
+        )
+        matrix = food - ownfood
+        return matrix
 
     def action_masking(self, raw_action_values: torch.Tensor, gameState: GameState):
         legal_actions = gameState.getLegalActions(self.index)
@@ -161,7 +173,34 @@ class NNTrainingAgent(CaptureAgent):
         return best_legal_action
 
     def convert_gamestate(self, gameState: GameState) -> torch.Tensor:
+        # get noisy distances
+        noisy_distances = gameState.getAgentDistances()
+        clean_distances = self.cleanup_distances(gameState, noisy_distances)
+
+        print(clean_distances)
         return torch.randn(1, self.observation_size)
+
+    def cleanup_distances(
+        self, gameState: GameState, noisy_distances: List[int]
+    ) -> List[int]:
+        """
+        Cleans up the noisy distances for agents that are in range.
+        """
+        own_pos = gameState.getAgentPosition(self.index)
+        # replace noisy distances with their true values if we can see the agent
+        for opponent_idx in self.getOpponents(gameState):
+            opponent_pos = gameState.getAgentPosition(opponent_idx)
+            if opponent_pos is not None:
+                distance = self.getMazeDistance(own_pos, opponent_pos)
+                noisy_distances[opponent_idx] = distance
+
+        for teammate_idx in self.getTeam(gameState):
+            teammate_pos = gameState.getAgentPosition(teammate_idx)
+            if teammate_pos is not None:
+                distance = self.getMazeDistance(own_pos, teammate_pos)
+                noisy_distances[teammate_idx] = distance
+
+        return noisy_distances
 
     def get_next_state(self, gameState: GameState, action: str) -> GameState:
         """
