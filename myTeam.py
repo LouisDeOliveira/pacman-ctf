@@ -14,7 +14,9 @@
 
 import random
 import time
-from typing import List
+from collections import deque
+from dataclasses import dataclass
+from typing import Generic, Iterable, List, TypeVar
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -32,6 +34,63 @@ from models import SimpleModel
 #################
 # Team creation #
 #################
+T = TypeVar("T")
+
+
+@dataclass
+class Transition:
+    state: np.ndarray
+    action: np.ndarray
+    next_state: np.ndarray
+    reward: float
+    done: bool
+
+
+Episode = list[Transition]
+
+
+def total_reward(episode: Episode) -> float:
+    return sum([t.reward for t in episode])
+
+
+class Buffer(Generic[T]):
+    def __init__(self, capacity=100000):
+        self.capacity = capacity
+        self.memory = deque([], maxlen=capacity)
+
+    def append(self, obj: T):
+        self.memory.append(obj)
+
+    def append_multiple(self, obj_list: list[T]):
+        for obj in obj_list:
+            self.memory.append(obj)
+
+    def sample(self, batch_size) -> Iterable[T]:
+        return random.sample(self.memory, batch_size)
+
+    def reset(self):
+        self.memory.clear()
+
+    def __len__(self):
+        return len(self.memory)
+
+
+class TransitionBuffer(Buffer[Transition]):
+    def __init__(self, capacity=100000):
+        super().__init__(capacity)
+
+    def append_episode(self, episode: Episode):
+        self.append_multiple(episode)
+
+    def get_batch(self, batch_size):
+        batch_of_transitions = self.sample(batch_size)
+        states = np.array([t.state for t in batch_of_transitions])
+        actions = np.array([t.action for t in batch_of_transitions])
+        next_states = np.array([t.next_state for t in batch_of_transitions])
+        rewards = np.array([t.reward for t in batch_of_transitions])
+        dones = np.array([t.done for t in batch_of_transitions])
+
+        return Transition(states, actions, next_states, rewards, dones)
 
 
 def createTeam(
@@ -119,10 +178,17 @@ class DummyAgent(CaptureAgent):
 
 
 class NNTrainingAgent(CaptureAgent):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.step = 0
+        self.game_step = 0
+        self.buffer = TransitionBuffer()
+
     def registerInitialState(self, gameState: GameState):
         """
         Do init stuff in here :)
         """
+        self.game_step = 0
         self.observation_size = 4
         self.action_size = 5
         self.hidden_size = 64
@@ -131,10 +197,16 @@ class NNTrainingAgent(CaptureAgent):
         self.model = SimpleModel(
             self.observation_size, self.action_size, self.hidden_size
         )
+        self.map_size = gameState.data.layout.width, gameState.data.layout.height
         self.last_turn_state = gameState
         CaptureAgent.registerInitialState(self, gameState)
 
     def chooseAction(self, gameState: GameState):
+        self.step += 1
+        self.game_step += 1
+        print(f"game step: {self.game_step}")
+        print(f"step: {self.step}")
+        self.make_vision_matrix(gameState)
         observation = self.convert_gamestate(gameState)
         action = self.model(observation)
         true_action = self.action_masking(action, gameState)  # action number
@@ -148,21 +220,102 @@ class NNTrainingAgent(CaptureAgent):
         # )
         # print(gameState.getAgentDistances())
         self.checkDeath(gameState, self.index)
+        # print(matrix.shape)
+        # print(f"map size: {self.map_size}")
 
         # update the last known state
         self.last_turn_state = gameState
         return final_action
 
-    def make_food_matrix(self, gameState: GameState):
-        """
-        Converts food data into numpy array.
-        """
-        food = np.array(self.getFood(gameState).data).astype(np.float32)
-        ownfood = np.array(self.getFoodYouAreDefending(gameState).data).astype(
-            np.float32
-        )
-        matrix = food - ownfood
-        return matrix
+    def checkEatenFoodAndCapsules(
+        self, gameState: GameState, last_turn_state: GameState
+    ):
+        now_food = self.getFoodYouAreDefending(gameState).asList()
+        previous_food = self.getFoodYouAreDefending(last_turn_state).asList()
+        previous_capsules = self.getCapsulesYouAreDefending(last_turn_state)
+        now_capsules = self.getCapsulesYouAreDefending(gameState)
+        eaten_capsules = list(set(previous_capsules) - set(now_capsules))
+        eaten_food = list(set(previous_food) - set(now_food))
+        return eaten_food + eaten_capsules
+
+    def checkIsScared(self, gameState: GameState, index: int):
+        return gameState.getAgentState(index).scaredTimer > 0
+
+    def checkIsPacman(self, gameState: GameState, index: int):
+        return gameState.getAgentState(index).isPacman
+
+    def checkWeCanEat(self, gameState: GameState, index: int):
+        scared = self.checkIsScared(gameState, index)
+        pacman = self.checkIsPacman(gameState, index)
+
+        if scared and not pacman:
+            return False
+        if not scared and not pacman:
+            return True
+
+    def make_vision_matrix(self, gameState: GameState):
+        matrix = np.zeros((*self.map_size, 3), dtype=np.uint8)
+        owncolor = np.array([0, 0, 200], dtype=np.uint8)
+        teammatecolor = np.array([0, 200, 0], dtype=np.uint8)
+        offset_teammate_color = np.array([0, 50, 0], dtype=np.uint8)
+        offset_own_color = np.array([0, 0, 50], dtype=np.uint8)
+        enemycolor = np.array([200, 0, 0], dtype=np.uint8)
+        wallcolor = np.array([255, 255, 255], dtype=np.uint8)
+        foodcolor = np.array([255, 255, 0], dtype=np.uint8)
+        enemyfoodcolor = np.array([255, 128, 0], dtype=np.uint8)
+        capsulecolor = np.array([255, 0, 255], dtype=np.uint8)
+        enemycapsulecolor = np.array([128, 0, 255], dtype=np.uint8)
+
+        own_pos = gameState.getAgentPosition(self.index)
+
+        matrix[own_pos[0], own_pos[1]] = owncolor
+        if self.checkIsPacman(gameState, self.index):
+            matrix[own_pos[0], own_pos[1]] = owncolor + offset_own_color
+        elif self.checkIsScared(gameState, self.index):
+            matrix[own_pos[0], own_pos[1]] = owncolor - offset_own_color
+
+        for ally in self.getTeam(gameState):
+            if ally != self.index:
+                position = gameState.getAgentPosition(ally)
+                if position is not None:
+                    matrix[position[0], position[1]] = teammatecolor
+                    if self.checkIsPacman(gameState, ally):
+                        matrix[position[0], position[1]] = (
+                            teammatecolor + offset_teammate_color
+                        )
+                    elif self.checkIsScared(gameState, ally):
+                        matrix[position[0], position[1]] = (
+                            teammatecolor - offset_teammate_color
+                        )
+
+        for enemy in self.getOpponents(gameState):
+            if enemy != self.index:
+                position = gameState.getAgentPosition(enemy)
+                if position is not None:
+                    matrix[position[0], position[1]] = enemycolor
+
+        for wall in gameState.getWalls().asList():
+            matrix[wall[0], wall[1]] = wallcolor
+
+        for ownfood in self.getFoodYouAreDefending(gameState).asList():
+            matrix[ownfood[0], ownfood[1]] = foodcolor
+
+        for food in self.getFood(gameState).asList():
+            matrix[food[0], food[1]] = enemyfoodcolor
+
+        for owncapsule in self.getCapsulesYouAreDefending(gameState):
+            matrix[owncapsule[0], owncapsule[1]] = capsulecolor
+
+        for capsule in self.getCapsules(gameState):
+            matrix[capsule[0], capsule[1]] = enemycapsulecolor
+
+        for eaten_stuff in self.checkEatenFoodAndCapsules(
+            gameState, self.last_turn_state
+        ):
+            matrix[eaten_stuff[0], eaten_stuff[1]] = enemycolor
+
+        plt.imshow(np.rot90(matrix))
+        plt.show()
 
     def action_masking(self, raw_action_values: torch.Tensor, gameState: GameState):
         legal_actions = gameState.getLegalActions(self.index)
@@ -181,12 +334,17 @@ class NNTrainingAgent(CaptureAgent):
         # get noisy distances
         noisy_distances = gameState.getAgentDistances()
         clean_distances = self.cleanup_distances(gameState, noisy_distances)
+        # print(f"Is pacman: {is_pacman}")
+        # print(f"Is red: {is_scared}")
+        # plt.imshow(food_matrix)
+        # plt.title("food matrix")
+        # plt.show()
 
-        print(clean_distances)
+        # print(clean_distances)
         return torch.randn(1, self.observation_size)
 
     def cleanup_distances(
-        self, gameState: GameState, noisy_distances: List[int]
+        self, gameState: GameState, noisy_distances: List[int], normalize: bool = True
     ) -> List[int]:
         """
         Cleans up the noisy distances for agents that are in range.
@@ -204,6 +362,13 @@ class NNTrainingAgent(CaptureAgent):
             if teammate_pos is not None:
                 distance = self.getMazeDistance(own_pos, teammate_pos)
                 noisy_distances[teammate_idx] = distance
+
+        if normalize:
+            # normalize distances
+            for i in range(len(noisy_distances)):
+                noisy_distances[i] = noisy_distances[i] / (
+                    self.map_size[0] + self.map_size[1]
+                )
 
         return noisy_distances
 
@@ -223,7 +388,7 @@ class NNTrainingAgent(CaptureAgent):
         self, current_state: GameState, previous_state: GameState
     ) -> float:
         """
-        positive reward if ennemy food is eaten, negative reward if ennemy food increases
+        positive reward if enemy food is eaten, negative reward if enemy food increases
         """
         current_food = self.getFood(current_state).data
         current_food = np.sum(np.array(current_food).astype(int))
