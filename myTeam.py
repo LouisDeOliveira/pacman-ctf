@@ -251,6 +251,7 @@ class NNTrainingAgent(CaptureAgent):
         observation = self.convert_gamestate(gameState)
         upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
         if random.random() < self.epsilon:
+            # take random action to explore
             legal_actions = gameState.getLegalActions(self.index)
             true_action = self.action_numbers[random.choice(legal_actions)]
 
@@ -319,15 +320,8 @@ class NNTrainingAgent(CaptureAgent):
         rewards = torch.tensor(np.array([x.reward for x in batch])).to(self.device)
         dones = torch.tensor(np.array([x.done for x in batch])).to(self.device)
 
-        # print(f"states: {states.shape}")
-        # print(f"next_states: {next_states.shape}")
-        # print(f"actions: {actions}")
-        # print(f"rewards: {rewards.shape}")
-        # print(f"dones: {dones}")
-
         # Compute the estimated values
         values = self.policy(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        # print(f"values: {values.shape}")
 
         next_values = torch.zeros(self.batch_size).to(self.device)
         with torch.no_grad():
@@ -336,11 +330,12 @@ class NNTrainingAgent(CaptureAgent):
 
         # Compute the target values
         target_values = rewards + self.gamma * next_values
-        # print(f"target_values: {target_values.shape}")
 
         loss = self.loss(values, target_values)
         self.optimizer.zero_grad()
         loss.backward()
+
+        # prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
         self.optimizer.step()
         self.loss_values.append(loss.item())
