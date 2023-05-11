@@ -18,6 +18,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Generic, Iterable, List, TypeVar
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -29,7 +30,7 @@ from capture import COLLISION_TOLERANCE, GameState
 from captureAgents import CaptureAgent
 from distanceCalculator import manhattanDistance
 from game import Directions
-from models import SimpleModel
+from models import CNNPolicy
 
 #################
 # Team creation #
@@ -40,7 +41,7 @@ T = TypeVar("T")
 @dataclass
 class Transition:
     state: np.ndarray
-    action: np.ndarray
+    action: int
     next_state: np.ndarray
     reward: float
     done: bool
@@ -91,6 +92,18 @@ class TransitionBuffer(Buffer[Transition]):
         dones = np.array([t.done for t in batch_of_transitions])
 
         return Transition(states, actions, next_states, rewards, dones)
+
+
+def timeit(func):
+    def timed(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        end = time.time()
+
+        print(f"{func.__name__} took {end - start} seconds")
+        return result
+
+    return timed
 
 
 def createTeam(
@@ -179,53 +192,181 @@ class DummyAgent(CaptureAgent):
 
 class NNTrainingAgent(CaptureAgent):
     def __init__(self, *args):
+        """
+        Real init, called only once and not on each reset
+        """
         super().__init__(*args)
         self.step = 0
         self.game_step = 0
+        self.episode_number = 0
         self.buffer = TransitionBuffer()
+        self.total_reward = 0
+        self.batch_size = 128
+        self.training_frequency = 32
+        self.plot_frequency = 100
+        self.update_target_frequency = 5
+        self.gamma = 0.99
+        self.epsilon = 0.1
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.action_numbers = {"North": 0, "South": 1, "East": 2, "West": 3, "Stop": 4}
+        self.action_names = {v: k for k, v in self.action_numbers.items()}
+        self.policy = CNNPolicy()
+        self.target = CNNPolicy()
+        self.loss = nn.SmoothL1Loss()
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=0.0001)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy.to(self.device)
+        self.target.to(self.device)
+        self.loss_values = []
+        self.total_reward_values = []
 
     def registerInitialState(self, gameState: GameState):
         """
         Do init stuff in here :)
         """
+        # print("I am agent " + str(self.index))
+        # print("Total reward from last game: " + str(self.total_reward))
+        if self.episode_number > 0:
+            self.total_reward_values.append(self.total_reward)
+        self.total_reward = 0
         self.game_step = 0
-        self.observation_size = 4
-        self.action_size = 5
-        self.hidden_size = 64
-        self.action_numbers = {"North": 0, "South": 1, "East": 2, "West": 3, "Stop": 4}
-        self.action_names = {v: k for k, v in self.action_numbers.items()}
-        self.model = SimpleModel(
-            self.observation_size, self.action_size, self.hidden_size
-        )
+        self.episode_number += 1
         self.map_size = gameState.data.layout.width, gameState.data.layout.height
         self.last_turn_state = gameState
+        self.last_turn_observation = self.upscale_matrix(
+            self.convert_gamestate(gameState), desired_size=(64, 128)
+        )
+        self.last_turn_action = 0
+        if self.episode_number % self.plot_frequency == 0:
+            self.plot_loss()
+        if self.episode_number % self.update_target_frequency == 0:
+            print("Updating target network")
+            self.target.load_state_dict(self.policy.state_dict())
+        print("Episode number: " + str(self.episode_number))
         CaptureAgent.registerInitialState(self, gameState)
 
     def chooseAction(self, gameState: GameState):
         self.step += 1
         self.game_step += 1
-        print(f"game step: {self.game_step}")
-        print(f"step: {self.step}")
-        self.make_vision_matrix(gameState)
         observation = self.convert_gamestate(gameState)
-        action = self.model(observation)
-        true_action = self.action_masking(action, gameState)  # action number
-        final_action = self.action_names[true_action.item()]  # action name
+        upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
+        if random.random() < self.epsilon:
+            legal_actions = gameState.getLegalActions(self.index)
+            true_action = self.action_numbers[random.choice(legal_actions)]
 
-        # print(f"food reward: {self.eat_food_reward(gameState, self.last_turn_state)}")
+        else:
+            action = self.policy(
+                torch.tensor(upscaled_observation)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(self.device)
+            )  # convert to tensor and add batch dimension
+            true_action = self.action_masking(action, gameState)  # action number
+        final_action = self.action_names[true_action]  # action name
 
-        # print(f"score diff reward: {self.score_diff_reward(gameState, next_state)}")
-        # print(
-        #     f"eaten food reward: {self.food_eaten_reward(gameState, self.last_turn_state)}"
-        # )
-        # print(gameState.getAgentDistances())
-        self.checkDeath(gameState, self.index)
-        # print(matrix.shape)
-        # print(f"map size: {self.map_size}")
+        reward = (
+            self.eat_food_reward(gameState, self.last_turn_state)
+            + self.score_diff_reward(gameState, self.last_turn_state)
+            + self.food_eaten_reward(gameState, self.last_turn_state)
+            + self.has_moved_reward(gameState, self.last_turn_state)
+        )
 
-        # update the last known state
+        # make a transition for the buffer
+        transition = self.make_transition(
+            self.last_turn_action,
+            self.last_turn_observation,
+            reward,
+            upscaled_observation,
+            gameState.isOver(),
+        )
+        self.buffer.append(transition)
+
+        self.total_reward += reward
         self.last_turn_state = gameState
+        self.last_turn_observation = upscaled_observation
+        self.last_turn_action = true_action
+        # print("Current buffer size: " + str(len(self.buffer)))
+
+        # update policy
+        if (
+            len(self.buffer) >= self.batch_size
+            and self.step % self.training_frequency == 0
+        ):
+            self.learn_step()
+
+        # update target network
+
         return final_action
+
+    def learn_step(self):
+        """
+        Use a batch from the buffer to update the policy
+        """
+        batch = self.buffer.sample(self.batch_size)
+        states = (
+            torch.tensor(np.array([x.state for x in batch]))
+            .to(self.device)
+            .permute(0, 3, 1, 2)
+        )
+        next_states = (
+            torch.tensor(np.array([x.next_state for x in batch]))
+            .to(self.device)
+            .permute(0, 3, 1, 2)
+        )
+        actions = torch.tensor(
+            np.array([x.action for x in batch]), dtype=torch.int64
+        ).to(self.device)
+        rewards = torch.tensor(np.array([x.reward for x in batch])).to(self.device)
+        dones = torch.tensor(np.array([x.done for x in batch])).to(self.device)
+
+        # print(f"states: {states.shape}")
+        # print(f"next_states: {next_states.shape}")
+        # print(f"actions: {actions}")
+        # print(f"rewards: {rewards.shape}")
+        # print(f"dones: {dones}")
+
+        # Compute the estimated values
+        values = self.policy(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # print(f"values: {values.shape}")
+
+        next_values = torch.zeros(self.batch_size).to(self.device)
+        with torch.no_grad():
+            # Theses are the values of the next states according to the target network
+            next_values[~dones] = self.target(next_states[~dones]).max(1)[0]
+
+        # Compute the target values
+        target_values = rewards + self.gamma * next_values
+        # print(f"target_values: {target_values.shape}")
+
+        loss = self.loss(values, target_values)
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
+        self.optimizer.step()
+        self.loss_values.append(loss.item())
+
+    def plot_loss(self):
+        # 2 plots side by side, loss and reward
+        fig, (ax1, ax2) = plt.subplots(1, 2)
+        ax1.plot(self.loss_values)
+        ax1.set_title(f"Loss, agent {self.index}")
+        ax1.set_xlabel("Training steps")
+        ax1.set_ylabel("Loss")
+        ax2.plot(self.total_reward_values)
+        ax2.set_title(f"Total reward, agent {self.index}")
+        ax2.set_xlabel("Training episodes")
+        ax2.set_ylabel("Total reward")
+        plt.show()
+
+    def make_transition(
+        self,
+        action: int,
+        observation: np.ndarray,
+        reward: float,
+        next_observation: np.ndarray,
+        done: bool,
+    ) -> Transition:
+        return Transition(observation, action, next_observation, reward, done)
 
     def checkEatenFoodAndCapsules(
         self, gameState: GameState, last_turn_state: GameState
@@ -314,8 +455,11 @@ class NNTrainingAgent(CaptureAgent):
         ):
             matrix[eaten_stuff[0], eaten_stuff[1]] = enemycolor
 
-        plt.imshow(np.rot90(matrix))
-        plt.show()
+        return matrix
+
+    # @timeit
+    def upscale_matrix(self, matrix: np.ndarray, desired_size: tuple):
+        return cv2.resize(matrix, desired_size, interpolation=cv2.INTER_NEAREST)
 
     def action_masking(self, raw_action_values: torch.Tensor, gameState: GameState):
         legal_actions = gameState.getLegalActions(self.index)
@@ -326,22 +470,19 @@ class NNTrainingAgent(CaptureAgent):
         large = torch.finfo(raw_action_values.dtype).max
 
         best_legal_action = (
-            raw_action_values - large * (1 - action_mask) - large * (1 - action_mask)
-        ).argmax()
+            (raw_action_values - large * (1 - action_mask) - large * (1 - action_mask))
+            .argmax()
+            .item()
+        )
         return best_legal_action
 
-    def convert_gamestate(self, gameState: GameState) -> torch.Tensor:
-        # get noisy distances
-        noisy_distances = gameState.getAgentDistances()
-        clean_distances = self.cleanup_distances(gameState, noisy_distances)
-        # print(f"Is pacman: {is_pacman}")
-        # print(f"Is red: {is_scared}")
-        # plt.imshow(food_matrix)
-        # plt.title("food matrix")
-        # plt.show()
-
-        # print(clean_distances)
-        return torch.randn(1, self.observation_size)
+    def convert_gamestate(self, gameState: GameState) -> np.ndarray:
+        """
+        Converts the gamestate to a numpy array, representing our world model.
+        """
+        matrix = self.make_vision_matrix(gameState)
+        matrix = matrix.astype(np.float32) / 255
+        return matrix
 
     def cleanup_distances(
         self, gameState: GameState, noisy_distances: List[int], normalize: bool = True
@@ -383,6 +524,13 @@ class NNTrainingAgent(CaptureAgent):
         self, current_state: GameState, successor: GameState
     ) -> float:
         return successor.getScore() - current_state.getScore()
+
+    def has_moved_reward(self, current_state: GameState, last_state: GameState):
+        current_pos = current_state.getAgentPosition(self.index)
+        last_pos = last_state.getAgentPosition(self.index)
+        if current_pos == last_pos:
+            return -1
+        return 0
 
     def eat_food_reward(
         self, current_state: GameState, previous_state: GameState
