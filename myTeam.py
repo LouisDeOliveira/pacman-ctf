@@ -26,6 +26,7 @@ import torch.nn as nn
 
 import game
 import util
+from baselineTeam import DefensiveReflexAgent, OffensiveReflexAgent
 from capture import COLLISION_TOLERANCE, GameState
 from captureAgents import CaptureAgent
 from distanceCalculator import manhattanDistance
@@ -199,12 +200,14 @@ class NNTrainingAgent(CaptureAgent):
         self.step = 0
         self.game_step = 0
         self.episode_number = 0
+        self.wins = 0
         self.buffer = TransitionBuffer()
         self.total_reward = 0
         self.batch_size = 128
         self.training_frequency = 32
-        self.plot_frequency = 100
+        self.plot_frequency = 5
         self.update_target_frequency = 5
+        self.save_checkpoint_frequency = 100
         self.gamma = 0.99
         self.epsilon = 0.1
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -219,6 +222,9 @@ class NNTrainingAgent(CaptureAgent):
         self.target.to(self.device)
         self.loss_values = []
         self.total_reward_values = []
+        self.episode_lentghts_values = []
+        self.refoffensiveagent = OffensiveReflexAgent(self.index)
+        self.refdefensiveagent = DefensiveReflexAgent(self.index)
 
     def registerInitialState(self, gameState: GameState):
         """
@@ -229,6 +235,11 @@ class NNTrainingAgent(CaptureAgent):
         if self.episode_number > 0:
             self.total_reward_values.append(self.total_reward)
         self.total_reward = 0
+        if self.episode_number > 0:
+            self.episode_lentghts_values.append(self.game_step)
+        if self.episode_number % self.save_checkpoint_frequency == 0:
+            self.save_policy("./policy_" + str(self.episode_number) + ".pt")
+            self.save_target("./target_" + str(self.episode_number) + ".pt")
         self.game_step = 0
         self.episode_number += 1
         self.map_size = gameState.data.layout.width, gameState.data.layout.height
@@ -237,12 +248,15 @@ class NNTrainingAgent(CaptureAgent):
             self.convert_gamestate(gameState), desired_size=(64, 128)
         )
         self.last_turn_action = 0
-        if self.episode_number % self.plot_frequency == 0:
-            self.plot_loss()
+        # if self.episode_number % self.plot_frequency == 0:
+        #     self.plot_loss()
         if self.episode_number % self.update_target_frequency == 0:
             print("Updating target network")
             self.target.load_state_dict(self.policy.state_dict())
+        print("wins: " + str(self.wins) + " out of " + str(self.episode_number))
         print("Episode number: " + str(self.episode_number))
+        self.refdefensiveagent.registerInitialState(gameState)
+        self.refoffensiveagent.registerInitialState(gameState)
         CaptureAgent.registerInitialState(self, gameState)
 
     def chooseAction(self, gameState: GameState):
@@ -251,9 +265,18 @@ class NNTrainingAgent(CaptureAgent):
         observation = self.convert_gamestate(gameState)
         upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
         if random.random() < self.epsilon:
-            # take random action to explore
-            legal_actions = gameState.getLegalActions(self.index)
-            true_action = self.action_numbers[random.choice(legal_actions)]
+            # we use actions not from the policy in this block
+            if random.random() < 0.33:
+                action = self.refdefensiveagent.chooseAction(gameState)
+                true_action = self.action_numbers[action]
+            # uuse offensive reflex agent action
+            elif random.random() < 0.66:
+                action = self.refoffensiveagent.chooseAction(gameState)
+                true_action = self.action_numbers[action]
+
+            else:
+                action = random.choice(gameState.getLegalActions(self.index))
+                true_action = self.action_numbers[action]
 
         else:
             action = self.policy(
@@ -294,8 +317,6 @@ class NNTrainingAgent(CaptureAgent):
             and self.step % self.training_frequency == 0
         ):
             self.learn_step()
-
-        # update target network
 
         return final_action
 
@@ -340,18 +361,54 @@ class NNTrainingAgent(CaptureAgent):
         self.optimizer.step()
         self.loss_values.append(loss.item())
 
+    def save_policy(self, path: str = "./policy.pt"):
+        torch.save(self.policy.state_dict(), path)
+
+    def save_target(self, path: str = "./target.pt"):
+        torch.save(self.target.state_dict(), path)
+
     def plot_loss(self):
-        # 2 plots side by side, loss and reward
-        fig, (ax1, ax2) = plt.subplots(1, 2)
-        ax1.plot(self.loss_values)
+        # 2 plots side by side, loss and reward with smoothing over last 50 episodes
+        N = 5
+        # overlaid on top of the raw data
+        smoothed_loss = np.convolve(self.loss_values, np.ones(N) / N, mode="valid")
+        smoothed_reward = np.convolve(
+            self.total_reward_values, np.ones(N) / N, mode="valid"
+        )
+        smoothed_episode_length = np.convolve(
+            self.episode_lentghts_values, np.ones(N) / N, mode="valid"
+        )
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3)
+        ax1.plot(self.loss_values, label="Raw", color="orange")
+        ax1.plot(smoothed_loss, label="Smoothed")
         ax1.set_title(f"Loss, agent {self.index}")
         ax1.set_xlabel("Training steps")
         ax1.set_ylabel("Loss")
-        ax2.plot(self.total_reward_values)
+        ax1.legend()
+        ax2.plot(self.total_reward_values, label="Raw", color="orange")
+        ax2.plot(smoothed_reward, label="Smoothed")
         ax2.set_title(f"Total reward, agent {self.index}")
         ax2.set_xlabel("Training episodes")
         ax2.set_ylabel("Total reward")
+        ax2.legend()
+        ax3.plot(self.episode_lentghts_values, label="Raw", color="orange")
+        ax3.plot(smoothed_episode_length, label="Smoothed")
+        ax3.set_title(f"Episode lenghts, agent {self.index}")
+        ax3.set_xlabel("Training episodes")
+        ax3.set_ylabel("Episode length")
+        ax3.legend()
         plt.show()
+
+        # fig, (ax1, ax2) = plt.subplots(1, 2)
+        # ax1.plot(self.loss_values)
+        # ax1.set_title(f"Loss, agent {self.index}")
+        # ax1.set_xlabel("Training steps")
+        # ax1.set_ylabel("Loss")
+        # ax2.plot(self.total_reward_values)
+        # ax2.set_title(f"Total reward, agent {self.index}")
+        # ax2.set_xlabel("Training episodes")
+        # ax2.set_ylabel("Total reward")
+        # plt.show()
 
     def make_transition(
         self,
@@ -604,3 +661,156 @@ class NNTrainingAgent(CaptureAgent):
                 "sdlfsdfksdjfsjfskldfjsdklfjskdlfjsdkfjskdlfjksdjfksdjfklsdjfjklsdjfklsdjfkjsdfkjsd"
             )
         return reward
+
+
+class NNPlayingAgent(CaptureAgent):
+    """
+    Agent use for playing with a pretrained neural network
+    """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.action_numbers = {"North": 0, "South": 1, "East": 2, "West": 3, "Stop": 4}
+        self.action_names = {v: k for k, v in self.action_numbers.items()}
+        self.policy = torch.load("policy.pt", map_location=self.device)
+
+    def registerInitialState(self, gameState: GameState):
+        """
+        Do init stuff in here :)
+        """
+        # print("I am agent " + str(self.index))
+        # print("Total reward from last game: " + str(self.total_reward))
+        self.map_size = gameState.data.layout.width, gameState.data.layout.height
+        self.last_turn_state = gameState
+        CaptureAgent.registerInitialState(self, gameState)
+
+    def action_masking(self, raw_action_values: torch.Tensor, gameState: GameState):
+        legal_actions = gameState.getLegalActions(self.index)
+        action_mask = torch.zeros_like(raw_action_values)
+        for action in legal_actions:
+            action_mask[0, self.action_numbers[action]] = 1
+
+        large = torch.finfo(raw_action_values.dtype).max
+
+        best_legal_action = (
+            (raw_action_values - large * (1 - action_mask) - large * (1 - action_mask))
+            .argmax()
+            .item()
+        )
+        return best_legal_action
+
+    def convert_gamestate(self, gameState: GameState) -> np.ndarray:
+        """
+        Converts the gamestate to a numpy array, representing our world model.
+        """
+        matrix = self.make_vision_matrix(gameState)
+        matrix = matrix.astype(np.float32) / 255
+        return matrix
+
+    def make_vision_matrix(self, gameState: GameState):
+        matrix = np.zeros((*self.map_size, 3), dtype=np.uint8)
+        owncolor = np.array([0, 0, 200], dtype=np.uint8)
+        teammatecolor = np.array([0, 200, 0], dtype=np.uint8)
+        offset_teammate_color = np.array([0, 50, 0], dtype=np.uint8)
+        offset_own_color = np.array([0, 0, 50], dtype=np.uint8)
+        enemycolor = np.array([200, 0, 0], dtype=np.uint8)
+        wallcolor = np.array([255, 255, 255], dtype=np.uint8)
+        foodcolor = np.array([255, 255, 0], dtype=np.uint8)
+        enemyfoodcolor = np.array([255, 128, 0], dtype=np.uint8)
+        capsulecolor = np.array([255, 0, 255], dtype=np.uint8)
+        enemycapsulecolor = np.array([128, 0, 255], dtype=np.uint8)
+
+        own_pos = gameState.getAgentPosition(self.index)
+
+        matrix[own_pos[0], own_pos[1]] = owncolor
+        if self.checkIsPacman(gameState, self.index):
+            matrix[own_pos[0], own_pos[1]] = owncolor + offset_own_color
+        elif self.checkIsScared(gameState, self.index):
+            matrix[own_pos[0], own_pos[1]] = owncolor - offset_own_color
+
+        for ally in self.getTeam(gameState):
+            if ally != self.index:
+                position = gameState.getAgentPosition(ally)
+                if position is not None:
+                    matrix[position[0], position[1]] = teammatecolor
+                    if self.checkIsPacman(gameState, ally):
+                        matrix[position[0], position[1]] = (
+                            teammatecolor + offset_teammate_color
+                        )
+                    elif self.checkIsScared(gameState, ally):
+                        matrix[position[0], position[1]] = (
+                            teammatecolor - offset_teammate_color
+                        )
+
+        for enemy in self.getOpponents(gameState):
+            if enemy != self.index:
+                position = gameState.getAgentPosition(enemy)
+                if position is not None:
+                    matrix[position[0], position[1]] = enemycolor
+
+        for wall in gameState.getWalls().asList():
+            matrix[wall[0], wall[1]] = wallcolor
+
+        for ownfood in self.getFoodYouAreDefending(gameState).asList():
+            matrix[ownfood[0], ownfood[1]] = foodcolor
+
+        for food in self.getFood(gameState).asList():
+            matrix[food[0], food[1]] = enemyfoodcolor
+
+        for owncapsule in self.getCapsulesYouAreDefending(gameState):
+            matrix[owncapsule[0], owncapsule[1]] = capsulecolor
+
+        for capsule in self.getCapsules(gameState):
+            matrix[capsule[0], capsule[1]] = enemycapsulecolor
+
+        for eaten_stuff in self.checkEatenFoodAndCapsules(
+            gameState, self.last_turn_state
+        ):
+            matrix[eaten_stuff[0], eaten_stuff[1]] = enemycolor
+
+        return matrix
+
+    def checkEatenFoodAndCapsules(
+        self, gameState: GameState, last_turn_state: GameState
+    ):
+        now_food = self.getFoodYouAreDefending(gameState).asList()
+        previous_food = self.getFoodYouAreDefending(last_turn_state).asList()
+        previous_capsules = self.getCapsulesYouAreDefending(last_turn_state)
+        now_capsules = self.getCapsulesYouAreDefending(gameState)
+        eaten_capsules = list(set(previous_capsules) - set(now_capsules))
+        eaten_food = list(set(previous_food) - set(now_food))
+        return eaten_food + eaten_capsules
+
+    def checkIsScared(self, gameState: GameState, index: int):
+        return gameState.getAgentState(index).scaredTimer > 0
+
+    def checkIsPacman(self, gameState: GameState, index: int):
+        return gameState.getAgentState(index).isPacman
+
+    def checkWeCanEat(self, gameState: GameState, index: int):
+        scared = self.checkIsScared(gameState, index)
+        pacman = self.checkIsPacman(gameState, index)
+
+        if scared and not pacman:
+            return False
+        if not scared and not pacman:
+            return True
+
+    def chooseAction(self, gameState: GameState):
+        observation = self.convert_gamestate(gameState)
+        upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
+
+        action = self.policy(
+            torch.tensor(upscaled_observation)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(self.device)
+        )  # convert to tensor and add batch dimension
+        true_action = self.action_masking(action, gameState)  # action number
+        final_action = self.action_names[true_action]  # action name
+        self.last_turn_state = gameState
+        return final_action
+
+    def upscale_matrix(self, matrix: np.ndarray, desired_size: tuple):
+        return cv2.resize(matrix, desired_size, interpolation=cv2.INTER_NEAREST)
