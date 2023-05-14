@@ -10,19 +10,24 @@
 # (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
 # Student side autograding was added by Brad Miller, Nick Hay, and
 # Pieter Abbeel (pabbeel@cs.berkeley.edu).
-
+USE_WANDB = True
 
 import random
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Generic, Iterable, List, TypeVar
+from typing import Generic, Iterable, List, Tuple, TypeVar
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+
+if USE_WANDB:
+    import wandb
+
+    wandb.init(project="pacman")
 
 import game
 import util
@@ -31,12 +36,58 @@ from capture import COLLISION_TOLERANCE, GameState
 from captureAgents import CaptureAgent
 from distanceCalculator import manhattanDistance
 from game import Directions
-from models import CNNPolicy
 
 #################
 # Team creation #
 #################
 T = TypeVar("T")
+import torch
+import torch.nn as nn
+
+
+class SimpleModel(nn.Module):
+    def __init__(
+        self, observation_size: int, action_size: int, hidden_size: int = 64
+    ) -> None:
+        super().__init__()
+        self.observation_size = observation_size
+        self.action_size = action_size
+        self.hidden_size = hidden_size
+
+        self.fc1 = nn.Linear(self.observation_size, self.hidden_size)
+        self.fc2 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.fc3 = nn.Linear(self.hidden_size, self.action_size)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class CNNPolicy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1)
+        # add average pooling layer
+        self.maxpool = nn.MaxPool2d(2)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(84, 5)
+
+    def forward(self, observation: torch.Tensor):
+        x = self.relu(self.conv1(observation))
+        x = self.maxpool(x)
+        x = self.relu(self.conv2(x))
+        x = self.maxpool(x)
+        x = self.relu(self.conv3(x))
+        x = self.maxpool(x)
+        x = torch.mean(x, dim=1)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
 
 
 @dataclass
@@ -112,7 +163,7 @@ def createTeam(
     secondIndex,
     isRed,
     first="NNTrainingAgent",
-    second="NNTrainingAgent",
+    second="DefensiveReflexAgent",
     numTraining=0,
 ):
     """
@@ -207,9 +258,10 @@ class NNTrainingAgent(CaptureAgent):
         self.training_frequency = 32
         self.plot_frequency = 5
         self.update_target_frequency = 5
-        self.save_checkpoint_frequency = 100
+        self.save_checkpoint_frequency = 200
         self.gamma = 0.99
-        self.epsilon = 0.1
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.999
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_numbers = {"North": 0, "South": 1, "East": 2, "West": 3, "Stop": 4}
         self.action_names = {v: k for k, v in self.action_numbers.items()}
@@ -220,9 +272,10 @@ class NNTrainingAgent(CaptureAgent):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy.to(self.device)
         self.target.to(self.device)
+        # self.load_weights("./policy_2000.pt", "./target_2000.pt")
         self.loss_values = []
         self.total_reward_values = []
-        self.episode_lentghts_values = []
+        self.episode_lenghts_values = []
         self.refoffensiveagent = OffensiveReflexAgent(self.index)
         self.refdefensiveagent = DefensiveReflexAgent(self.index)
 
@@ -234,12 +287,18 @@ class NNTrainingAgent(CaptureAgent):
         # print("Total reward from last game: " + str(self.total_reward))
         if self.episode_number > 0:
             self.total_reward_values.append(self.total_reward)
+            if USE_WANDB:
+                wandb.log({"Total reward": self.total_reward})
         self.total_reward = 0
         if self.episode_number > 0:
-            self.episode_lentghts_values.append(self.game_step)
+            self.episode_lenghts_values.append(self.game_step)
+            if USE_WANDB:
+                wandb.log({"Episode length": self.game_step})
         if self.episode_number % self.save_checkpoint_frequency == 0:
+            print("Saving checkpoint")
             self.save_policy("./policy_" + str(self.episode_number) + ".pt")
             self.save_target("./target_" + str(self.episode_number) + ".pt")
+        print("Episode number: " + str(self.episode_number))
         self.game_step = 0
         self.episode_number += 1
         self.map_size = gameState.data.layout.width, gameState.data.layout.height
@@ -251,32 +310,53 @@ class NNTrainingAgent(CaptureAgent):
         # if self.episode_number % self.plot_frequency == 0:
         #     self.plot_loss()
         if self.episode_number % self.update_target_frequency == 0:
-            print("Updating target network")
+            # print("Updating target network")
             self.target.load_state_dict(self.policy.state_dict())
-        print("wins: " + str(self.wins) + " out of " + str(self.episode_number))
-        print("Episode number: " + str(self.episode_number))
+        # print("wins: " + str(self.wins) + " out of " + str(self.episode_number))
+        # print("Episode number: " + str(self.episode_number))
         self.refdefensiveagent.registerInitialState(gameState)
         self.refoffensiveagent.registerInitialState(gameState)
         CaptureAgent.registerInitialState(self, gameState)
+
+    def game_outcome(self, gameState: GameState):
+        """
+        returns 1 if we won the game, 0 for a draw and -1 if we lost the game
+        """
+        if gameState.isOver():
+            if self.red:
+                if gameState.getScore() > 0:
+                    return 1
+                elif gameState.getScore() == 0:
+                    return 0
+                else:
+                    return -1
+            else:
+                if gameState.getScore() < 0:
+                    return 1
+                elif gameState.getScore() == 0:
+                    return 0
+                else:
+                    return -1
 
     def chooseAction(self, gameState: GameState):
         self.step += 1
         self.game_step += 1
         observation = self.convert_gamestate(gameState)
         upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
-        if random.random() < self.epsilon:
+        rand = random.random()
+        if rand < self.epsilon:
             # we use actions not from the policy in this block
-            if random.random() < 0.33:
-                action = self.refdefensiveagent.chooseAction(gameState)
-                true_action = self.action_numbers[action]
+            # if rand < 0.33:
+            #     action = self.refdefensiveagent.chooseAction(gameState)
+            #     true_action = self.action_numbers[action]
             # uuse offensive reflex agent action
-            elif random.random() < 0.66:
-                action = self.refoffensiveagent.chooseAction(gameState)
-                true_action = self.action_numbers[action]
+            # elif rand < 0.66:
+            action = self.refoffensiveagent.chooseAction(gameState)
+            true_action = self.action_numbers[action]
 
-            else:
-                action = random.choice(gameState.getLegalActions(self.index))
-                true_action = self.action_numbers[action]
+            # else:
+            #     action = random.choice(gameState.getLegalActions(self.index))
+            #     true_action = self.action_numbers[action]
 
         else:
             action = self.policy(
@@ -290,9 +370,9 @@ class NNTrainingAgent(CaptureAgent):
 
         reward = (
             self.eat_food_reward(gameState, self.last_turn_state)
-            + self.score_diff_reward(gameState, self.last_turn_state)
-            + self.food_eaten_reward(gameState, self.last_turn_state)
-            + self.has_moved_reward(gameState, self.last_turn_state)
+            # + self.score_diff_reward(gameState, self.last_turn_state)
+            # + self.food_eaten_reward(gameState, self.last_turn_state)
+            # + self.has_moved_reward(gameState, self.last_turn_state)
         )
 
         # make a transition for the buffer
@@ -317,8 +397,20 @@ class NNTrainingAgent(CaptureAgent):
             and self.step % self.training_frequency == 0
         ):
             self.learn_step()
+        self.epsilon *= self.epsilon_decay
+        if USE_WANDB:
+            outcome = self.game_outcome(gameState)
+            if outcome is not None:
+                wandb.log({"Game outcome": outcome})
 
         return final_action
+
+    def load_weights(self, policy_path, target_path):
+        """
+        Load weights from a file, to avoid having to train from scratch
+        """
+        self.policy.load_state_dict(torch.load(policy_path))
+        self.target.load_state_dict(torch.load(target_path))
 
     def learn_step(self):
         """
@@ -360,6 +452,8 @@ class NNTrainingAgent(CaptureAgent):
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
         self.optimizer.step()
         self.loss_values.append(loss.item())
+        if USE_WANDB:
+            wandb.log({"loss": loss.item()})
 
     def save_policy(self, path: str = "./policy.pt"):
         torch.save(self.policy.state_dict(), path)
@@ -376,7 +470,7 @@ class NNTrainingAgent(CaptureAgent):
             self.total_reward_values, np.ones(N) / N, mode="valid"
         )
         smoothed_episode_length = np.convolve(
-            self.episode_lentghts_values, np.ones(N) / N, mode="valid"
+            self.episode_lenghts_values, np.ones(N) / N, mode="valid"
         )
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3)
         ax1.plot(self.loss_values, label="Raw", color="orange")
@@ -391,7 +485,7 @@ class NNTrainingAgent(CaptureAgent):
         ax2.set_xlabel("Training episodes")
         ax2.set_ylabel("Total reward")
         ax2.legend()
-        ax3.plot(self.episode_lentghts_values, label="Raw", color="orange")
+        ax3.plot(self.episode_lenghts_values, label="Raw", color="orange")
         ax3.plot(smoothed_episode_length, label="Smoothed")
         ax3.set_title(f"Episode lenghts, agent {self.index}")
         ax3.set_xlabel("Training episodes")
@@ -657,9 +751,10 @@ class NNTrainingAgent(CaptureAgent):
                         # The powered up enemy pacman killed us!
                         reward = -1
         if reward != 0:
-            print(
-                "sdlfsdfksdjfsjfskldfjsdklfjskdlfjsdkfjskdlfjksdjfksdjfklsdjfjklsdjfklsdjfkjsdfkjsd"
-            )
+            # print(
+            #     "sdlfsdfksdjfsjfskldfjsdklfjskdlfjsdkfjskdlfjksdjfksdjfklsdjfjklsdjfklsdjfkjsdfkjsd"
+            # )
+            pass
         return reward
 
 
@@ -670,10 +765,13 @@ class NNPlayingAgent(CaptureAgent):
 
     def __init__(self, *args):
         super().__init__(*args)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")
         self.action_numbers = {"North": 0, "South": 1, "East": 2, "West": 3, "Stop": 4}
         self.action_names = {v: k for k, v in self.action_numbers.items()}
-        self.policy = torch.load("policy.pt", map_location=self.device)
+        self.policy = CNNPolicy().to(self.device)
+        self.policy.load_state_dict(
+            torch.load("./policy_2000.pt", map_location=self.device)
+        )
 
     def registerInitialState(self, gameState: GameState):
         """
@@ -800,7 +898,9 @@ class NNPlayingAgent(CaptureAgent):
     def chooseAction(self, gameState: GameState):
         observation = self.convert_gamestate(gameState)
         upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
-
+        # plt.imshow(upscaled_observation)
+        # plt.imsave("test.png", upscaled_observation)
+        # plt.show()
         action = self.policy(
             torch.tensor(upscaled_observation)
             .permute(2, 0, 1)
