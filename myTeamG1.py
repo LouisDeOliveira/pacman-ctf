@@ -314,9 +314,14 @@ class NNTrainingAgent(CaptureAgent):
             self.target.load_state_dict(self.policy.state_dict())
         # print("wins: " + str(self.wins) + " out of " + str(self.episode_number))
         # print("Episode number: " + str(self.episode_number))
+
         self.refdefensiveagent.registerInitialState(gameState)
         self.refoffensiveagent.registerInitialState(gameState)
         CaptureAgent.registerInitialState(self, gameState)
+        self.MAX_DIST = max(self.distancer._distances.values())
+
+    def count_food(self, gameState: GameState):
+        return len(self.getFood(gameState).asList())
 
     def game_outcome(self, gameState: GameState):
         """
@@ -341,6 +346,7 @@ class NNTrainingAgent(CaptureAgent):
     def chooseAction(self, gameState: GameState):
         self.step += 1
         self.game_step += 1
+        print(f"number of food left: {self.count_food(gameState)}")
         observation = self.convert_gamestate(gameState)
         upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
         rand = random.random()
@@ -531,14 +537,36 @@ class NNTrainingAgent(CaptureAgent):
     def checkIsPacman(self, gameState: GameState, index: int):
         return gameState.getAgentState(index).isPacman
 
-    def checkWeCanEat(self, gameState: GameState, index: int):
-        scared = self.checkIsScared(gameState, index)
-        pacman = self.checkIsPacman(gameState, index)
-
-        if scared and not pacman:
-            return False
-        if not scared and not pacman:
+    def isVulnerable(self, gameState: GameState, index: int):
+        enemy_index = self.getOpponents(gameState)[0]
+        if self.checkIsScared(gameState, index):
             return True
+        elif self.checkIsPacman(gameState, index) and not self.checkIsScared(
+            gameState, enemy_index
+        ):
+            return True
+        else:
+            return False
+
+    def checkCanGoUp(self, gameState: GameState, index: int):
+        return not gameState.hasWall(
+            self.get_own_pos(gameState)[0], self.get_own_pos(gameState)[1] + 1
+        )
+
+    def checkCanGoDown(self, gameState: GameState, index: int):
+        return not gameState.hasWall(
+            self.get_own_pos(gameState)[0], self.get_own_pos(gameState)[1] - 1
+        )
+
+    def checkCanGoLeft(self, gameState: GameState, index: int):
+        return not gameState.hasWall(
+            self.get_own_pos(gameState)[0] - 1, self.get_own_pos(gameState)[1]
+        )
+
+    def checkCanGoRight(self, gameState: GameState, index: int):
+        return not gameState.hasWall(
+            self.get_own_pos(gameState)[0] + 1, self.get_own_pos(gameState)[1]
+        )
 
     def get_own_pos(self, gameState: GameState) -> Tuple[int, int]:
         return gameState.getAgentPosition(self.index)
@@ -549,37 +577,58 @@ class NNTrainingAgent(CaptureAgent):
         """
         obs = []
         own_pos = self.get_own_pos(gameState)
-        # distances to 10 closest food
+        # distances to 65 closest food
         foods = self.getFood(gameState).asList()
-        food_distances = sorted([self.getMazeDistance(own_pos, food) for food in foods])
-        obs += food_distances[:10]
+        food_distances = sorted(
+            [self.getMazeDistance(own_pos, food) / self.MAX_DIST for food in foods]
+        )
+        if len(food_distances) < 65:
+            obs += food_distances
+            obs += [1] * (10 - len(food_distances))
+        else:
+            obs += food_distances[:65]
         # distance to powerup
         capsules = self.getCapsules(gameState)
         if len(capsules) > 0:
             dist = self.getMazeDistance(own_pos, capsules[0])
-            obs.append(dist)
+            obs.append(dist / self.MAX_DIST)
         else:
-            obs.append(0)
+            obs.append(1)
         # distance to teaammate
         for ally in self.getTeam(gameState):
             if ally != self.index:
                 ally_pos = gameState.getAgentPosition(ally)
                 if ally_pos is not None:
                     dist = self.getMazeDistance(own_pos, ally_pos)
-                    obs.append(dist)
+                    obs.append(dist / self.MAX_DIST)
                 else:
-                    obs.append(0)
+                    obs.append(1)
         # distance to enemies
         for enemy in self.getOpponents(gameState):
             if enemy != self.index:
                 ennemy_pos = gameState.getAgentPosition(enemy)
                 if ennemy_pos is not None:
                     dist = self.getMazeDistance(own_pos, ennemy_pos)
-                    obs.append(dist)
+                    obs.append(dist / self.MAX_DIST)
                 else:
                     # if not observable use a noisy distance
                     dist = gameState.getAgentDistances()[enemy]
-                    obs.append(dist)
+                    dist = max(0, dist)
+                    obs.append(dist / self.MAX_DIST)
+        # is scared
+        obs.append(int(self.checkIsScared(gameState, self.index)))
+        # is pacman
+        obs.append(int(self.checkIsPacman(gameState, self.index)))
+
+        # check if we can go up, down, left, right
+        obs.append(int(self.checkCanGoUp(gameState, self.index)))
+        obs.append(int(self.checkCanGoDown(gameState, self.index)))
+        obs.append(int(self.checkCanGoLeft(gameState, self.index)))
+        obs.append(int(self.checkCanGoRight(gameState, self.index)))
+
+        obs_array = np.array(obs)
+        print(obs_array.shape)
+        return obs_array
 
     def make_vision_matrix(self, gameState: GameState):
         """
@@ -588,8 +637,7 @@ class NNTrainingAgent(CaptureAgent):
         matrix = np.zeros((*self.map_size, 3), dtype=np.uint8)
         owncolor = np.array([0, 0, 200], dtype=np.uint8)
         teammatecolor = np.array([0, 200, 0], dtype=np.uint8)
-        offset_teammate_color = np.array([0, 50, 0], dtype=np.uint8)
-        offset_own_color = np.array([0, 0, 50], dtype=np.uint8)
+        offset_color = np.array([0, 50, 0], dtype=np.uint8)
         enemycolor = np.array([200, 0, 0], dtype=np.uint8)
         wallcolor = np.array([255, 255, 255], dtype=np.uint8)
         foodcolor = np.array([255, 255, 0], dtype=np.uint8)
@@ -600,24 +648,16 @@ class NNTrainingAgent(CaptureAgent):
         own_pos = gameState.getAgentPosition(self.index)
 
         matrix[own_pos[0], own_pos[1]] = owncolor
-        if self.checkIsPacman(gameState, self.index):
-            matrix[own_pos[0], own_pos[1]] = owncolor + offset_own_color
-        elif self.checkIsScared(gameState, self.index):
-            matrix[own_pos[0], own_pos[1]] = owncolor - offset_own_color
+        if self.isVulnerable(gameState, self.index):
+            matrix[own_pos[0], own_pos[1]] = owncolor + offset_color
 
         for ally in self.getTeam(gameState):
             if ally != self.index:
                 position = gameState.getAgentPosition(ally)
                 if position is not None:
                     matrix[position[0], position[1]] = teammatecolor
-                    if self.checkIsPacman(gameState, ally):
-                        matrix[position[0], position[1]] = (
-                            teammatecolor + offset_teammate_color
-                        )
-                    elif self.checkIsScared(gameState, ally):
-                        matrix[position[0], position[1]] = (
-                            teammatecolor - offset_teammate_color
-                        )
+                    if self.isVulnerable(gameState, self.index):
+                        matrix[position[0], position[1]] = teammatecolor + offset_color
 
         for enemy in self.getOpponents(gameState):
             if enemy != self.index:
