@@ -10,7 +10,7 @@
 # (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
 # Student side autograding was added by Brad Miller, Nick Hay, and
 # Pieter Abbeel (pabbeel@cs.berkeley.edu).
-USE_WANDB = True
+USE_WANDB = False
 
 import random
 import time
@@ -162,8 +162,8 @@ def createTeam(
     firstIndex,
     secondIndex,
     isRed,
-    first="NNTrainingAgent",
-    second="DefensiveReflexAgent",
+    first="NNPlayingAgent",
+    second="NNPlayingAgent",
     numTraining=0,
 ):
     """
