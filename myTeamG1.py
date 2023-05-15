@@ -34,7 +34,7 @@ import util
 from baselineTeam import DefensiveReflexAgent, OffensiveReflexAgent
 from capture import COLLISION_TOLERANCE, GameState
 from captureAgents import CaptureAgent
-from distanceCalculator import manhattanDistance
+from distanceCalculator import Distancer, manhattanDistance
 from game import Directions
 
 #################
@@ -162,8 +162,8 @@ def createTeam(
     firstIndex,
     secondIndex,
     isRed,
-    first="NNPlayingAgent",
-    second="NNPlayingAgent",
+    first="NNTrainingAgent",
+    second="NNTrainingAgent",
     numTraining=0,
 ):
     """
@@ -540,7 +540,51 @@ class NNTrainingAgent(CaptureAgent):
         if not scared and not pacman:
             return True
 
+    def get_own_pos(self, gameState: GameState) -> Tuple[int, int]:
+        return gameState.getAgentPosition(self.index)
+
+    def make_vision_vector(self, gameState: GameState):
+        """
+        Generates an observation for a MLP based policy
+        """
+        obs = []
+        own_pos = self.get_own_pos(gameState)
+        # distances to 10 closest food
+        foods = self.getFood(gameState).asList()
+        food_distances = sorted([self.getMazeDistance(own_pos, food) for food in foods])
+        obs += food_distances[:10]
+        # distance to powerup
+        capsules = self.getCapsules(gameState)
+        if len(capsules) > 0:
+            dist = self.getMazeDistance(own_pos, capsules[0])
+            obs.append(dist)
+        else:
+            obs.append(0)
+        # distance to teaammate
+        for ally in self.getTeam(gameState):
+            if ally != self.index:
+                ally_pos = gameState.getAgentPosition(ally)
+                if ally_pos is not None:
+                    dist = self.getMazeDistance(own_pos, ally_pos)
+                    obs.append(dist)
+                else:
+                    obs.append(0)
+        # distance to enemies
+        for enemy in self.getOpponents(gameState):
+            if enemy != self.index:
+                ennemy_pos = gameState.getAgentPosition(enemy)
+                if ennemy_pos is not None:
+                    dist = self.getMazeDistance(own_pos, ennemy_pos)
+                    obs.append(dist)
+                else:
+                    # if not observable use a noisy distance
+                    dist = gameState.getAgentDistances()[enemy]
+                    obs.append(dist)
+
     def make_vision_matrix(self, gameState: GameState):
+        """
+        Generates an observation for a CNN based policy
+        """
         matrix = np.zeros((*self.map_size, 3), dtype=np.uint8)
         owncolor = np.array([0, 0, 200], dtype=np.uint8)
         teammatecolor = np.array([0, 200, 0], dtype=np.uint8)
