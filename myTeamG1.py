@@ -10,7 +10,6 @@
 # (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
 # Student side autograding was added by Brad Miller, Nick Hay, and
 # Pieter Abbeel (pabbeel@cs.berkeley.edu).
-USE_WANDB = False
 
 import random
 import time
@@ -24,25 +23,26 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-if USE_WANDB:
-    import wandb
-
-    wandb.init(project="pacman")
-
 import game
 import util
 from baselineTeam import DefensiveReflexAgent, OffensiveReflexAgent
 from capture import COLLISION_TOLERANCE, GameState
 from captureAgents import CaptureAgent
-from distanceCalculator import Distancer, manhattanDistance
+from distanceCalculator import manhattanDistance
 from game import Directions
+
+USE_WANDB = True
+
+if USE_WANDB:
+    import wandb
+
+    wandb.init(project="pacman")
+
 
 #################
 # Team creation #
 #################
 T = TypeVar("T")
-import torch
-import torch.nn as nn
 
 
 class SimpleModel(nn.Module):
@@ -145,6 +145,14 @@ class TransitionBuffer(Buffer[Transition]):
 
         return Transition(states, actions, next_states, rewards, dones)
 
+    def sample_weighted(self, batch_size):
+        """
+        Sample experiences weighted by reward
+        """
+        rewards = [t.reward for t in self.memory]
+        weights = [t.reward + abs(min(rewards)) for t in self.memory]
+        return random.choices(self.memory, weights=weights, k=batch_size)
+
 
 def timeit(func):
     def timed(*args, **kwargs):
@@ -163,7 +171,7 @@ def createTeam(
     secondIndex,
     isRed,
     first="NNTrainingAgent",
-    second="NNTrainingAgent",
+    second="DefensiveReflexAgent",
     numTraining=0,
 ):
     """
@@ -252,27 +260,30 @@ class NNTrainingAgent(CaptureAgent):
         self.game_step = 0
         self.episode_number = 0
         self.wins = 0
-        self.buffer = TransitionBuffer()
+        self.buffer = TransitionBuffer(capacity=10000)
         self.total_reward = 0
         self.batch_size = 128
         self.training_frequency = 32
         self.plot_frequency = 5
         self.update_target_frequency = 5
-        self.save_checkpoint_frequency = 200
+        self.save_checkpoint_frequency = 50
         self.gamma = 0.99
-        self.epsilon = 1.0
+        self.epsilon = 0.1
+        self.epsilon_min = 0.1
         self.epsilon_decay = 0.999
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_numbers = {"North": 0, "South": 1, "East": 2, "West": 3, "Stop": 4}
         self.action_names = {v: k for k, v in self.action_numbers.items()}
-        self.policy = CNNPolicy()
-        self.target = CNNPolicy()
+        # self.policy = CNNPolicy()
+        # self.target = CNNPolicy()
+        self.policy = SimpleModel(observation_size=75, action_size=5)
+        self.target = SimpleModel(observation_size=75, action_size=5)
         self.loss = nn.SmoothL1Loss()
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=0.0001)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy.to(self.device)
         self.target.to(self.device)
-        # self.load_weights("./policy_2000.pt", "./target_2000.pt")
+        # self.load_weights("./policy_450.pt", "./target_450.pt")
         self.loss_values = []
         self.total_reward_values = []
         self.episode_lenghts_values = []
@@ -285,6 +296,8 @@ class NNTrainingAgent(CaptureAgent):
         """
         # print("I am agent " + str(self.index))
         # print("Total reward from last game: " + str(self.total_reward))
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
         if self.episode_number > 0:
             self.total_reward_values.append(self.total_reward)
             if USE_WANDB:
@@ -303,9 +316,9 @@ class NNTrainingAgent(CaptureAgent):
         self.episode_number += 1
         self.map_size = gameState.data.layout.width, gameState.data.layout.height
         self.last_turn_state = gameState
-        self.last_turn_observation = self.upscale_matrix(
-            self.convert_gamestate(gameState), desired_size=(64, 128)
-        )
+        # self.last_turn_observation = self.upscale_matrix(
+        #     self.convert_gamestate(gameState), desired_size=(64, 128)
+        # )
         self.last_turn_action = 0
         # if self.episode_number % self.plot_frequency == 0:
         #     self.plot_loss()
@@ -319,66 +332,56 @@ class NNTrainingAgent(CaptureAgent):
         self.refoffensiveagent.registerInitialState(gameState)
         CaptureAgent.registerInitialState(self, gameState)
         self.MAX_DIST = max(self.distancer._distances.values())
+        self.last_turn_observation = self.make_vision_vector(gameState)
+        self.start_pos = gameState.getAgentPosition(self.index)
 
     def count_food(self, gameState: GameState):
         return len(self.getFood(gameState).asList())
 
-    def game_outcome(self, gameState: GameState):
-        """
-        returns 1 if we won the game, 0 for a draw and -1 if we lost the game
-        """
-        if gameState.isOver():
-            if self.red:
-                if gameState.getScore() > 0:
-                    return 1
-                elif gameState.getScore() == 0:
-                    return 0
-                else:
-                    return -1
-            else:
-                if gameState.getScore() < 0:
-                    return 1
-                elif gameState.getScore() == 0:
-                    return 0
-                else:
-                    return -1
+    def distance_to_start_reward(self, gameState: GameState):
+        distance = self.getMazeDistance(
+            gameState.getAgentPosition(self.index), self.start_pos
+        )
+        score = distance / self.MAX_DIST
+        return -1 / (score + 1)
 
     def chooseAction(self, gameState: GameState):
         self.step += 1
         self.game_step += 1
-        print(f"number of food left: {self.count_food(gameState)}")
-        observation = self.convert_gamestate(gameState)
-        upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
+        # print(f"number of food left: {self.count_food(gameState)}")
+        # observation = self.convert_gamestate(gameState)
+        # observation = self.upscale_matrix(observation, desired_size=(64, 128))
+        observation = self.make_vision_vector(gameState)
+        # print(observation.shape)
         rand = random.random()
         if rand < self.epsilon:
             # we use actions not from the policy in this block
-            # if rand < 0.33:
-            #     action = self.refdefensiveagent.chooseAction(gameState)
-            #     true_action = self.action_numbers[action]
-            # uuse offensive reflex agent action
-            # elif rand < 0.66:
-            action = self.refoffensiveagent.chooseAction(gameState)
-            true_action = self.action_numbers[action]
-
-            # else:
-            #     action = random.choice(gameState.getLegalActions(self.index))
-            #     true_action = self.action_numbers[action]
-
+            final_action = self.refoffensiveagent.chooseAction(gameState)
+            true_action = self.action_numbers[final_action]
         else:
+            # action = self.policy(
+            #     torch.tensor(observation).permute(2, 0, 1).unsqueeze(0).to(self.device)
+            # )  # convert to tensor and add batch dimension
             action = self.policy(
-                torch.tensor(upscaled_observation)
-                .permute(2, 0, 1)
+                torch.tensor(observation, dtype=torch.float32)
                 .unsqueeze(0)
                 .to(self.device)
             )  # convert to tensor and add batch dimension
             true_action = self.action_masking(action, gameState)  # action number
         final_action = self.action_names[true_action]  # action name
 
+        eatFoodRwdd = self.eat_food_reward(gameState, self.last_turn_state)
+        scoreDiffRwd = self.score_diff_reward(gameState, self.last_turn_state)
+        # self.food_eaten_reward(gameState, self.last_turn_state)
+        hasMovedRwd = -1 if final_action == "Stop" else 0
+        killedEnemyRwd = self.checkKill(gameState, self.last_turn_state, self.index)
+        distanceGoalRwd = self.distance_to_start_reward(gameState)
+        # print(
+        #     f"eatFoodRwdd: {eatFoodRwdd}, scoreDiffRwd: {scoreDiffRwd},hasMovedRwd: {hasMovedRwd}, killedEnemyRwd: {killedEnemyRwd}, distanceGoalRwd: {distanceGoalRwd}"
+        # )
+
         reward = (
-            self.eat_food_reward(gameState, self.last_turn_state)
-            # + self.score_diff_reward(gameState, self.last_turn_state)
-            # + self.food_eaten_reward(gameState, self.last_turn_state)
-            # + self.has_moved_reward(gameState, self.last_turn_state)
+            eatFoodRwdd + scoreDiffRwd + hasMovedRwd + killedEnemyRwd + distanceGoalRwd
         )
 
         # make a transition for the buffer
@@ -386,14 +389,14 @@ class NNTrainingAgent(CaptureAgent):
             self.last_turn_action,
             self.last_turn_observation,
             reward,
-            upscaled_observation,
+            observation,
             gameState.isOver(),
         )
         self.buffer.append(transition)
 
         self.total_reward += reward
         self.last_turn_state = gameState
-        self.last_turn_observation = upscaled_observation
+        self.last_turn_observation = observation
         self.last_turn_action = true_action
         # print("Current buffer size: " + str(len(self.buffer)))
 
@@ -404,10 +407,7 @@ class NNTrainingAgent(CaptureAgent):
         ):
             self.learn_step()
         self.epsilon *= self.epsilon_decay
-        if USE_WANDB:
-            outcome = self.game_outcome(gameState)
-            if outcome is not None:
-                wandb.log({"Game outcome": outcome})
+        self.epsilon = max(self.epsilon, self.epsilon_min)
 
         return final_action
 
@@ -423,15 +423,9 @@ class NNTrainingAgent(CaptureAgent):
         Use a batch from the buffer to update the policy
         """
         batch = self.buffer.sample(self.batch_size)
-        states = (
-            torch.tensor(np.array([x.state for x in batch]))
-            .to(self.device)
-            .permute(0, 3, 1, 2)
-        )
-        next_states = (
-            torch.tensor(np.array([x.next_state for x in batch]))
-            .to(self.device)
-            .permute(0, 3, 1, 2)
+        states = torch.tensor(np.array([x.state for x in batch])).to(self.device)
+        next_states = torch.tensor(np.array([x.next_state for x in batch])).to(
+            self.device
         )
         actions = torch.tensor(
             np.array([x.action for x in batch]), dtype=torch.int64
@@ -498,17 +492,6 @@ class NNTrainingAgent(CaptureAgent):
         ax3.set_ylabel("Episode length")
         ax3.legend()
         plt.show()
-
-        # fig, (ax1, ax2) = plt.subplots(1, 2)
-        # ax1.plot(self.loss_values)
-        # ax1.set_title(f"Loss, agent {self.index}")
-        # ax1.set_xlabel("Training steps")
-        # ax1.set_ylabel("Loss")
-        # ax2.plot(self.total_reward_values)
-        # ax2.set_title(f"Total reward, agent {self.index}")
-        # ax2.set_xlabel("Training episodes")
-        # ax2.set_ylabel("Total reward")
-        # plt.show()
 
     def make_transition(
         self,
@@ -626,8 +609,7 @@ class NNTrainingAgent(CaptureAgent):
         obs.append(int(self.checkCanGoLeft(gameState, self.index)))
         obs.append(int(self.checkCanGoRight(gameState, self.index)))
 
-        obs_array = np.array(obs)
-        print(obs_array.shape)
+        obs_array = np.array(obs, dtype=np.float32)
         return obs_array
 
     def make_vision_matrix(self, gameState: GameState):
@@ -753,7 +735,11 @@ class NNTrainingAgent(CaptureAgent):
     def score_diff_reward(
         self, current_state: GameState, successor: GameState
     ) -> float:
-        return successor.getScore() - current_state.getScore()
+        change = successor.getScore() - current_state.getScore()
+        if self.red:
+            return change
+        else:
+            return -change
 
     def has_moved_reward(self, current_state: GameState, last_state: GameState):
         current_pos = current_state.getAgentPosition(self.index)
@@ -768,12 +754,19 @@ class NNTrainingAgent(CaptureAgent):
         """
         positive reward if enemy food is eaten, negative reward if enemy food increases
         """
-        current_food = self.getFood(current_state).data
-        current_food = np.sum(np.array(current_food).astype(int))
+        current_carried_food = current_state.getAgentState(self.index).numCarrying
+        prev_carried_food = previous_state.getAgentState(self.index).numCarrying
 
-        prev_food = self.getFood(previous_state).data
-        prev_food = np.sum(np.array(prev_food).astype(int))
-        return prev_food - current_food
+        current_num_returned = current_state.getAgentState(self.index).numReturned
+        prev_num_returned = previous_state.getAgentState(self.index).numReturned
+
+        diff_returned = current_num_returned - prev_num_returned
+        diff_carried = current_carried_food - prev_carried_food
+
+        if diff_returned > 0:
+            return diff_returned
+        else:
+            return diff_carried
 
     def food_eaten_reward(
         self, current_state: GameState, previous_state: GameState
@@ -787,6 +780,35 @@ class NNTrainingAgent(CaptureAgent):
         prev_food = self.getFoodYouAreDefending(previous_state).data
         prev_food = np.sum(np.array(prev_food).astype(int))
         return current_food - prev_food
+
+    def checkKill(self, state: GameState, prevState: GameState, agentIndex: int):
+        reward = 0.0
+        ownFoodAppeared = self.food_eaten_reward(state, prevState)
+        thisAgentPrevState = prevState.data.agentStates[agentIndex]
+        if state.isOnRedTeam(agentIndex):
+            otherTeam = state.getBlueTeamIndices()
+        else:
+            otherTeam = state.getRedTeamIndices()
+
+        if ownFoodAppeared > 0:  # if food has appeared in our field
+            if (
+                not thisAgentPrevState.isPacman and thisAgentPrevState.scaredTimer <= 0
+            ):  # should we check this for the previous state?
+                for index in otherTeam:
+                    otherAgentPrevState = prevState.data.agentStates[index]
+                    if not otherAgentPrevState.isPacman:  # if the enemy is a Ghost,
+                        continue
+                    enemyPackmanPosition = otherAgentPrevState.getPosition()
+                    if enemyPackmanPosition is None:
+                        continue
+                    if (
+                        manhattanDistance(
+                            enemyPackmanPosition, thisAgentPrevState.getPosition()
+                        )
+                        <= COLLISION_TOLERANCE
+                    ):
+                        reward = ownFoodAppeared
+        return reward
 
     def checkDeath(self, state: GameState, agentIndex: int):
         reward = 0
@@ -802,13 +824,12 @@ class NNTrainingAgent(CaptureAgent):
                 if otherAgentState.isPacman:
                     continue
                 ghostPosition = otherAgentState.getPosition()
-                if ghostPosition == None:
+                if ghostPosition is None:
                     continue
                 if (
                     manhattanDistance(ghostPosition, thisAgentState.getPosition())
                     <= COLLISION_TOLERANCE
                 ):
-                    # award points to the other team for killing Pacmen
                     if otherAgentState.scaredTimer <= 0:
                         # ghost killed this Pac-man!
                         reward = -1
@@ -821,7 +842,7 @@ class NNTrainingAgent(CaptureAgent):
                 if not otherAgentState.isPacman:
                     continue
                 pacPos = otherAgentState.getPosition()
-                if pacPos == None:
+                if pacPos is None:
                     continue
                 if (
                     manhattanDistance(pacPos, thisAgentState.getPosition())
@@ -854,7 +875,7 @@ class NNPlayingAgent(CaptureAgent):
         self.action_names = {v: k for k, v in self.action_numbers.items()}
         self.policy = CNNPolicy().to(self.device)
         self.policy.load_state_dict(
-            torch.load("./policy_2000.pt", map_location=self.device)
+            torch.load("./policy_100.pt", map_location=self.device)
         )
 
     def registerInitialState(self, gameState: GameState):
@@ -865,6 +886,7 @@ class NNPlayingAgent(CaptureAgent):
         # print("Total reward from last game: " + str(self.total_reward))
         self.map_size = gameState.data.layout.width, gameState.data.layout.height
         self.last_turn_state = gameState
+        self.refoffensiveagent = OffensiveReflexAgent(self.index)
         CaptureAgent.registerInitialState(self, gameState)
 
     def action_masking(self, raw_action_values: torch.Tensor, gameState: GameState):
@@ -891,11 +913,13 @@ class NNPlayingAgent(CaptureAgent):
         return matrix
 
     def make_vision_matrix(self, gameState: GameState):
+        """
+        Generates an observation for a CNN based policy
+        """
         matrix = np.zeros((*self.map_size, 3), dtype=np.uint8)
         owncolor = np.array([0, 0, 200], dtype=np.uint8)
         teammatecolor = np.array([0, 200, 0], dtype=np.uint8)
-        offset_teammate_color = np.array([0, 50, 0], dtype=np.uint8)
-        offset_own_color = np.array([0, 0, 50], dtype=np.uint8)
+        offset_color = np.array([0, 50, 0], dtype=np.uint8)
         enemycolor = np.array([200, 0, 0], dtype=np.uint8)
         wallcolor = np.array([255, 255, 255], dtype=np.uint8)
         foodcolor = np.array([255, 255, 0], dtype=np.uint8)
@@ -906,24 +930,16 @@ class NNPlayingAgent(CaptureAgent):
         own_pos = gameState.getAgentPosition(self.index)
 
         matrix[own_pos[0], own_pos[1]] = owncolor
-        if self.checkIsPacman(gameState, self.index):
-            matrix[own_pos[0], own_pos[1]] = owncolor + offset_own_color
-        elif self.checkIsScared(gameState, self.index):
-            matrix[own_pos[0], own_pos[1]] = owncolor - offset_own_color
+        if self.isVulnerable(gameState, self.index):
+            matrix[own_pos[0], own_pos[1]] = owncolor + offset_color
 
         for ally in self.getTeam(gameState):
             if ally != self.index:
                 position = gameState.getAgentPosition(ally)
                 if position is not None:
                     matrix[position[0], position[1]] = teammatecolor
-                    if self.checkIsPacman(gameState, ally):
-                        matrix[position[0], position[1]] = (
-                            teammatecolor + offset_teammate_color
-                        )
-                    elif self.checkIsScared(gameState, ally):
-                        matrix[position[0], position[1]] = (
-                            teammatecolor - offset_teammate_color
-                        )
+                    if self.isVulnerable(gameState, self.index):
+                        matrix[position[0], position[1]] = teammatecolor + offset_color
 
         for enemy in self.getOpponents(gameState):
             if enemy != self.index:
@@ -998,3 +1014,14 @@ class NNPlayingAgent(CaptureAgent):
 
     def upscale_matrix(self, matrix: np.ndarray, desired_size: tuple):
         return cv2.resize(matrix, desired_size, interpolation=cv2.INTER_NEAREST)
+
+    def isVulnerable(self, gameState: GameState, index: int):
+        enemy_index = self.getOpponents(gameState)[0]
+        if self.checkIsScared(gameState, index):
+            return True
+        elif self.checkIsPacman(gameState, index) and not self.checkIsScared(
+            gameState, enemy_index
+        ):
+            return True
+        else:
+            return False
