@@ -274,10 +274,10 @@ class NNTrainingAgent(CaptureAgent):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.action_numbers = {"North": 0, "South": 1, "East": 2, "West": 3, "Stop": 4}
         self.action_names = {v: k for k, v in self.action_numbers.items()}
-        # self.policy = CNNPolicy()
-        # self.target = CNNPolicy()
-        self.policy = SimpleModel(observation_size=75, action_size=5)
-        self.target = SimpleModel(observation_size=75, action_size=5)
+        self.policy = CNNPolicy()
+        self.target = CNNPolicy()
+        # self.policy = SimpleModel(observation_size=75, action_size=5)
+        # self.target = SimpleModel(observation_size=75, action_size=5)
         self.loss = nn.SmoothL1Loss()
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=0.0001)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -332,7 +332,8 @@ class NNTrainingAgent(CaptureAgent):
         self.refoffensiveagent.registerInitialState(gameState)
         CaptureAgent.registerInitialState(self, gameState)
         self.MAX_DIST = max(self.distancer._distances.values())
-        self.last_turn_observation = self.make_vision_vector(gameState)
+        observation = self.convert_gamestate(gameState)
+        self.last_turn_observation = self.upscale_matrix(observation, desired_size=(64, 128))
         self.start_pos = gameState.getAgentPosition(self.index)
 
     def count_food(self, gameState: GameState):
@@ -349,9 +350,9 @@ class NNTrainingAgent(CaptureAgent):
         self.step += 1
         self.game_step += 1
         # print(f"number of food left: {self.count_food(gameState)}")
-        # observation = self.convert_gamestate(gameState)
-        # observation = self.upscale_matrix(observation, desired_size=(64, 128))
-        observation = self.make_vision_vector(gameState)
+        observation = self.convert_gamestate(gameState)
+        observation = self.upscale_matrix(observation, desired_size=(64, 128))
+        # observation = self.make_vision_vector(gameState)
         # print(observation.shape)
         rand = random.random()
         if rand < self.epsilon:
@@ -359,14 +360,14 @@ class NNTrainingAgent(CaptureAgent):
             final_action = self.refoffensiveagent.chooseAction(gameState)
             true_action = self.action_numbers[final_action]
         else:
-            # action = self.policy(
-            #     torch.tensor(observation).permute(2, 0, 1).unsqueeze(0).to(self.device)
-            # )  # convert to tensor and add batch dimension
             action = self.policy(
-                torch.tensor(observation, dtype=torch.float32)
-                .unsqueeze(0)
-                .to(self.device)
+                torch.tensor(observation).permute(2, 0, 1).unsqueeze(0).to(self.device)
             )  # convert to tensor and add batch dimension
+            # action = self.policy(
+            #     torch.tensor(observation, dtype=torch.float32)
+            #     .unsqueeze(0)
+            #     .to(self.device)
+            # )  # convert to tensor and add batch dimension
             true_action = self.action_masking(action, gameState)  # action number
         final_action = self.action_names[true_action]  # action name
 
@@ -423,15 +424,17 @@ class NNTrainingAgent(CaptureAgent):
         Use a batch from the buffer to update the policy
         """
         batch = self.buffer.sample(self.batch_size)
-        states = torch.tensor(np.array([x.state for x in batch])).to(self.device)
+        #print([x.state.shape for x in batch if x.state.shape != (128,64,3)])
+        states = torch.tensor(np.array([x.state for x in batch])).to(self.device).permute(0,3,1,2)
         next_states = torch.tensor(np.array([x.next_state for x in batch])).to(
             self.device
-        )
+        ).permute(0,3,1,2)
         actions = torch.tensor(
             np.array([x.action for x in batch]), dtype=torch.int64
         ).to(self.device)
         rewards = torch.tensor(np.array([x.reward for x in batch])).to(self.device)
         dones = torch.tensor(np.array([x.done for x in batch])).to(self.device)
+        
 
         # Compute the estimated values
         values = self.policy(states).gather(1, actions.unsqueeze(1)).squeeze(1)
