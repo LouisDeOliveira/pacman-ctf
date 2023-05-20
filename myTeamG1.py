@@ -26,7 +26,7 @@ import torch.nn as nn
 import game
 import util
 from baselineTeam import DefensiveReflexAgent, OffensiveReflexAgent
-from capture import COLLISION_TOLERANCE, GameState
+from capture import COLLISION_TOLERANCE, MIN_FOOD, TOTAL_FOOD, GameState
 from captureAgents import CaptureAgent
 from distanceCalculator import manhattanDistance
 from game import Directions
@@ -100,8 +100,8 @@ class CNNPolicy(nn.Module):
         # add average pooling layer
         self.maxpool = nn.MaxPool2d(2)
         self.relu = nn.ReLU()
-        self.fc = nn.Linear(5376, 1024)
-        self.fc2 = nn.Linear(1024, 5)
+        self.fc = nn.Linear(14080, 32)
+        self.fc2 = nn.Linear(32, 5)
 
     def forward(self, observation: torch.Tensor):
         x = self.relu(self.conv1(observation))
@@ -197,7 +197,7 @@ def createTeam(
     firstIndex,
     secondIndex,
     isRed,
-    first="AETrainingAgent",
+    first="NNTrainingAgent",
     second="DefensiveReflexAgent",
     numTraining=0,
 ):
@@ -484,6 +484,7 @@ class NNTrainingAgent(CaptureAgent):
         # self.load_weights("./policy_450.pt", "./target_450.pt")
         self.refoffensiveagent = OffensiveReflexAgent(self.index)
         self.refdefensiveagent = DefensiveReflexAgent(self.index)
+        print("device: ", self.device)
 
     def registerInitialState(self, gameState: GameState):
         """
@@ -546,19 +547,51 @@ class NNTrainingAgent(CaptureAgent):
     def count_food(self, gameState: GameState):
         return len(self.getFood(gameState).asList())
     
-    def isGameOver(self, gameState: GameState):
-        print("timeLeft: ", gameState.data.timeleft)
-        if gameState.isOver():
-            print ("gameState.isOver(): ", gameState.isOver())
-            input()
-        # if game.gameOver:
-        #     print ("game.gameOver: ", game.gameOver)
-        if gameState.data._win:
-            print ("gameState.data._win: ", gameState.data._win)
-            input()
-        if gameState.data._lose:
-            print ("gameState.data._lose: ", gameState.data._lose)
-            input()
+    def gameOverScoreRwd(self, gameState: GameState):
+        if gameState.isOnRedTeam(self.index):
+            ourTeamScoreSign = 1
+        else:
+            ourTeamScoreSign = -1
+        #if time is up the game has ended
+        if gameState.data.timeleft <= 4:
+            print("Time is up.")
+            return gameState.getScore()*ourTeamScoreSign*10
+        #otherwise check if one of the teams has eaten all the food
+     
+        redCount = 0
+        blueCount = 0
+        foodToWin = (TOTAL_FOOD / 2) - MIN_FOOD
+        for index in range(gameState.getNumAgents()):
+            agentState = gameState.data.agentStates[index]
+            if index in gameState.getRedTeamIndices():
+                redCount += agentState.numReturned
+            else:
+                blueCount += agentState.numReturned
+
+        if blueCount >= foodToWin:  # state.getRedFood().count() == MIN_FOOD:
+            print(
+                "The Blue team has returned at least %d of the opponents' dots."
+                % foodToWin
+            )
+            return gameState.getScore()*ourTeamScoreSign*10
+        elif redCount >= foodToWin:  # state.getBlueFood().count() == MIN_FOOD:
+            print(
+                "The Red team has returned at least %d of the opponents' dots."
+                % foodToWin
+            )
+            return gameState.getScore()*ourTeamScoreSign*10
+        return 0
+        # if gameState.isOver():
+        #     print ("gameState.isOver(): ", gameState.isOver())
+        #     input()
+        # # if game.gameOver:
+        # #     print ("game.gameOver: ", game.gameOver)
+        # if gameState.data._win:
+        #     print ("gameState.data._win: ", gameState.data._win)
+        #     input()
+        # if gameState.data._lose:
+        #     print ("gameState.data._lose: ", gameState.data._lose)
+        #     input()
         # if gameState.isWin():
         #     print ("isWin: ", gameState.isWin())
         # if gameState.isLose():
@@ -567,7 +600,6 @@ class NNTrainingAgent(CaptureAgent):
         #     print ("isWin2" , game.state.isWin())
         # if game.state.isLose():
         #     print ("isLose2" , game.state.isLose())
-        return gameState.isOver()
 
     def distance_to_start_reward(self, gameState: GameState):
         distance = self.getMazeDistance(
@@ -582,7 +614,6 @@ class NNTrainingAgent(CaptureAgent):
         return observation
 
     def chooseAction(self, gameState: GameState):
-        isGameOver = self.isGameOver(gameState)
         self.step += 1
         self.game_step += 1
 
@@ -613,14 +644,16 @@ class NNTrainingAgent(CaptureAgent):
             true_action = self.action_masking(action, gameState)  # action number
         final_action = self.action_names[true_action]  # action name
 
-        eatFoodRwdd = self.eat_food_reward(gameState, self.last_turn_state)
-        scoreDiffRwd = self.score_diff_reward(gameState, self.last_turn_state)
-        hasMovedRwd = -1 if final_action == "Stop" else 0
-        killedEnemyRwd = self.checkKill(gameState, self.last_turn_state, self.index)
-        distanceGoalRwd = self.distance_to_start_reward(gameState)
+        eat_food_rwd = self.eat_food_reward(gameState, self.last_turn_state)
+        score_diff_rwd = self.score_diff_reward(gameState, self.last_turn_state)
+        has_moved_rwd = -1 if final_action == "Stop" else 0
+        killed_enemy_rwd = self.checkKill(gameState, self.last_turn_state, self.index)
+        dist_to_start_rwd = self.distance_to_start_reward(gameState)
+        game_over_score_rwd = self.gameOverScoreRwd(gameState)
+        
 
         reward = (
-            eatFoodRwdd + scoreDiffRwd + hasMovedRwd + killedEnemyRwd + distanceGoalRwd
+            eat_food_rwd + score_diff_rwd + has_moved_rwd + killed_enemy_rwd + dist_to_start_rwd + game_over_score_rwd
         )
 
         # make a transition for the buffer
@@ -827,8 +860,6 @@ class NNTrainingAgent(CaptureAgent):
         obs.append(int(self.checkCanGoDown(gameState, self.index)))
         obs.append(int(self.checkCanGoLeft(gameState, self.index)))
         obs.append(int(self.checkCanGoRight(gameState, self.index)))
-        if len(obs) != 75:
-            print(len(obs))
         obs_array = np.array(obs, dtype=np.float32)
         return obs_array
 
