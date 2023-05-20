@@ -70,25 +70,34 @@ class ImageAutoEncoder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.encoder = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 64, 3, stride=1, padding=1),  #
+            torch.nn.Conv2d(3, 16, 3, stride=1, padding=1),  #
             torch.nn.ReLU(True),
-            torch.nn.MaxPool2d(2, stride=1),
-            torch.nn.Conv2d(64, 16, 3, stride=1, padding=1),  # b, 8, 3, 3
+            torch.nn.MaxPool2d(
+                2,
+            ),
+            torch.nn.Conv2d(16, 32, 3, stride=1, padding=1),  # b, 8, 3, 3
             torch.nn.ReLU(True),
-            torch.nn.MaxPool2d(2, stride=1),  # b, 8, 2, 2
+            torch.nn.MaxPool2d(2),  # b, 8, 2, 2,
+            # torch.nn.Conv2d(16, 8, 3, stride=1, padding=1),  # b, 8, 3, 3
+            # torch.nn.ReLU(True),
+            # torch.nn.MaxPool2d(2),  # b, 8, 2, 2
         )
 
         self.decoder = torch.nn.Sequential(
-            torch.nn.Upsample(scale_factor=1, mode="nearest"),
-            torch.nn.Conv2d(16, 64, 3, stride=1, padding=1),  # b, 16, 10, 10
+            torch.nn.UpsamplingNearest2d(scale_factor=(2, 2)),
+            torch.nn.Conv2d(32, 16, 3, stride=1, padding=1),  # b, 16, 10, 10
             torch.nn.ReLU(True),
-            torch.nn.Upsample(scale_factor=1, mode="nearest"),
-            torch.nn.Conv2d(64, 3, 3, stride=1, padding=2),  # b, 8, 3, 3
+            torch.nn.UpsamplingNearest2d(scale_factor=(2, 2)),
+            torch.nn.Conv2d(16, 3, 3, stride=1, padding=2),  # b, 16, 10, 10
+            # torch.nn.UpsamplingNearest2d(scale_factor=(2, 2)),
+            # torch.nn.Conv2d(64, 3, 3, stride=1, padding=2),  # b, 8, 3, 3
             torch.nn.Sigmoid(),
         )
 
     def forward(self, x: torch.Tensor):
-        return self.decoder(self.encoder(x))
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
 
 
 class CNNPolicy(nn.Module):
@@ -100,8 +109,8 @@ class CNNPolicy(nn.Module):
         # add average pooling layer
         self.maxpool = nn.MaxPool2d(2)
         self.relu = nn.ReLU()
-        self.fc = nn.Linear(5376, 1024)
-        self.fc2 = nn.Linear(1024, 5)
+        self.fc = nn.Linear(2560, 128)
+        self.fc2 = nn.Linear(128, 5)
 
     def forward(self, observation: torch.Tensor):
         x = self.relu(self.conv1(observation))
@@ -197,7 +206,7 @@ def createTeam(
     firstIndex,
     secondIndex,
     isRed,
-    first="AETrainingAgent",
+    first="NNTrainingAgent",
     second="DefensiveReflexAgent",
     numTraining=0,
 ):
@@ -314,9 +323,8 @@ class AETrainingAgent(CaptureAgent):
         self.map_size = gameState.data.layout.width, gameState.data.layout.height
         self.last_turn_state = gameState
 
-    def make_CNN_input(self, gameState: GameState, desired_size=(96, 192)):
+    def make_CNN_input(self, gameState: GameState):
         observation = self.convert_gamestate(gameState)
-        observation = self.upscale_matrix(observation, desired_size=desired_size)
         return observation
 
     def upscale_matrix(self, matrix: np.ndarray, desired_size: tuple):
@@ -425,7 +433,7 @@ class AETrainingAgent(CaptureAgent):
 
         # Compute the estimated values
         reconstructed = self.AE(images)
-
+        # print(images.shape, reconstructed.shape)
         loss = self.loss(images, reconstructed)
         self.optimizer.zero_grad()
         loss.backward()
@@ -463,7 +471,7 @@ class NNTrainingAgent(CaptureAgent):
         self.update_target_frequency = 5
         self.save_checkpoint_frequency = 100
         self.gamma = 0.99
-        self.epsilon = 0.1
+        self.epsilon = 1.0
         self.epsilon_min = 0.1
         self.epsilon_decay = 0.999
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -553,7 +561,7 @@ class NNTrainingAgent(CaptureAgent):
         score = distance / self.MAX_DIST
         return -1 / (score + 1)
 
-    def make_CNN_input(self, gameState: GameState, desired_size=(96, 192)):
+    def make_CNN_input(self, gameState: GameState, desired_size=(48, 96)):
         observation = self.convert_gamestate(gameState)
         observation = self.upscale_matrix(observation, desired_size=desired_size)
         return observation
@@ -1192,7 +1200,7 @@ class NNPlayingAgent(CaptureAgent):
 
     def chooseAction(self, gameState: GameState):
         observation = self.convert_gamestate(gameState)
-        upscaled_observation = self.upscale_matrix(observation, desired_size=(96, 192))
+        upscaled_observation = self.upscale_matrix(observation, desired_size=(48, 96))
         # plt.imshow(upscaled_observation)
         # plt.imsave("test.png", upscaled_observation)
         # plt.show()
