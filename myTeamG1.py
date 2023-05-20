@@ -656,7 +656,7 @@ class NNTrainingAgent(CaptureAgent):
         score_diff_rwd = self.score_diff_reward(gameState, self.last_turn_state)
         has_moved_rwd = -1 if final_action == "Stop" else 0
         killed_enemy_rwd = self.checkKill(gameState, self.last_turn_state, self.index)
-        dist_to_start_rwd = self.distance_to_start_reward(gameState)
+        # dist_to_start_rwd = self.distance_to_start_reward(gameState)
         game_over_score_rwd = self.gameOverScoreRwd(gameState)
 
         reward = (
@@ -664,7 +664,7 @@ class NNTrainingAgent(CaptureAgent):
             + score_diff_rwd
             + has_moved_rwd
             + killed_enemy_rwd
-            + dist_to_start_rwd
+            # + dist_to_start_rwd
             + game_over_score_rwd
         )
 
