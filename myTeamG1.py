@@ -66,16 +66,42 @@ class SimpleModel(nn.Module):
         return x
 
 
+class ImageAutoEncoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 64, 3, stride=1, padding=1),  #
+            torch.nn.ReLU(True),
+            torch.nn.MaxPool2d(2, stride=1),
+            torch.nn.Conv2d(64, 16, 3, stride=1, padding=1),  # b, 8, 3, 3
+            torch.nn.ReLU(True),
+            torch.nn.MaxPool2d(2, stride=1),  # b, 8, 2, 2
+        )
+
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Upsample(scale_factor=1, mode="nearest"),
+            torch.nn.Conv2d(16, 64, 3, stride=1, padding=1),  # b, 16, 10, 10
+            torch.nn.ReLU(True),
+            torch.nn.Upsample(scale_factor=1, mode="nearest"),
+            torch.nn.Conv2d(64, 3, 3, stride=1, padding=2),  # b, 8, 3, 3
+            torch.nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor):
+        return self.decoder(self.encoder(x))
+
+
 class CNNPolicy(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         # add average pooling layer
         self.maxpool = nn.MaxPool2d(2)
         self.relu = nn.ReLU()
-        self.fc = nn.Linear(84, 5)
+        self.fc = nn.Linear(5376, 1024)
+        self.fc2 = nn.Linear(1024, 5)
 
     def forward(self, observation: torch.Tensor):
         x = self.relu(self.conv1(observation))
@@ -84,9 +110,10 @@ class CNNPolicy(nn.Module):
         x = self.maxpool(x)
         x = self.relu(self.conv3(x))
         x = self.maxpool(x)
-        x = torch.mean(x, dim=1)
-        x = x.view(x.size(0), -1)
+        x = torch.flatten(x, 1)
         x = self.fc(x)
+        x = self.relu(x)
+        x = self.fc2(x)
         return x
 
 
@@ -170,7 +197,7 @@ def createTeam(
     firstIndex,
     secondIndex,
     isRed,
-    first="NNTrainingAgent",
+    first="AETrainingAgent",
     second="DefensiveReflexAgent",
     numTraining=0,
 ):
@@ -250,7 +277,172 @@ class DummyAgent(CaptureAgent):
         return random.choice(actions)
 
 
-USE_IMAGE = False
+USE_IMAGE = True
+
+
+class AETrainingAgent(CaptureAgent):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.AE = ImageAutoEncoder().to(self.device)
+        self.loss = nn.MSELoss()
+        self.optimizer = torch.optim.Adam(self.AE.parameters(), lr=0.0001)
+        self.refoffensiveagent = OffensiveReflexAgent(self.index)
+        self.step = 0
+        self.episode = 0
+        self.game_step = 0
+        self.batch_size = 32
+        self.save_every = 100
+        self.buffer = Buffer(capacity=20000)
+
+    def chooseAction(self, gameState):
+        self.game_step += 1
+        obs = self.make_CNN_input(gameState)
+        self.buffer.append(obs)
+        if len(self.buffer) > self.batch_size and self.game_step % 32 == 0:
+            self.learn_step()
+        self.last_turn_state = gameState
+        return self.refoffensiveagent.chooseAction(gameState)
+
+    def registerInitialState(self, gameState):
+        self.episode += 1
+        self.game_step = 0
+        if self.episode % self.save_every == 0:
+            torch.save(self.AE.state_dict(), f"AE_{self.episode}.pt")
+        CaptureAgent.registerInitialState(self, gameState)
+        self.refoffensiveagent.registerInitialState(gameState)
+        self.map_size = gameState.data.layout.width, gameState.data.layout.height
+        self.last_turn_state = gameState
+
+    def make_CNN_input(self, gameState: GameState, desired_size=(96, 192)):
+        observation = self.convert_gamestate(gameState)
+        observation = self.upscale_matrix(observation, desired_size=desired_size)
+        return observation
+
+    def upscale_matrix(self, matrix: np.ndarray, desired_size: tuple):
+        return cv2.resize(matrix, desired_size, interpolation=cv2.INTER_NEAREST)
+
+    def make_vision_matrix(self, gameState: GameState):
+        """
+        Generates an observation for a CNN based policy
+        """
+        matrix = np.zeros((*self.map_size, 3), dtype=np.uint8)
+        owncolor = np.array([0, 0, 200], dtype=np.uint8)
+        teammatecolor = np.array([0, 200, 0], dtype=np.uint8)
+        offset_color = np.array([0, 50, 0], dtype=np.uint8)
+        enemycolor = np.array([200, 0, 0], dtype=np.uint8)
+        wallcolor = np.array([255, 255, 255], dtype=np.uint8)
+        foodcolor = np.array([255, 255, 0], dtype=np.uint8)
+        enemyfoodcolor = np.array([255, 128, 0], dtype=np.uint8)
+        capsulecolor = np.array([255, 0, 255], dtype=np.uint8)
+        enemycapsulecolor = np.array([128, 0, 255], dtype=np.uint8)
+
+        own_pos = gameState.getAgentPosition(self.index)
+
+        matrix[own_pos[0], own_pos[1]] = owncolor
+        if self.isVulnerable(gameState, self.index):
+            matrix[own_pos[0], own_pos[1]] = owncolor + offset_color
+
+        for ally in self.getTeam(gameState):
+            if ally != self.index:
+                position = gameState.getAgentPosition(ally)
+                if position is not None:
+                    matrix[position[0], position[1]] = teammatecolor
+                    if self.isVulnerable(gameState, self.index):
+                        matrix[position[0], position[1]] = teammatecolor + offset_color
+
+        for enemy in self.getOpponents(gameState):
+            if enemy != self.index:
+                position = gameState.getAgentPosition(enemy)
+                if position is not None:
+                    matrix[position[0], position[1]] = enemycolor
+
+        for wall in gameState.getWalls().asList():
+            matrix[wall[0], wall[1]] = wallcolor
+
+        for ownfood in self.getFoodYouAreDefending(gameState).asList():
+            matrix[ownfood[0], ownfood[1]] = foodcolor
+
+        for food in self.getFood(gameState).asList():
+            matrix[food[0], food[1]] = enemyfoodcolor
+
+        for owncapsule in self.getCapsulesYouAreDefending(gameState):
+            matrix[owncapsule[0], owncapsule[1]] = capsulecolor
+
+        for capsule in self.getCapsules(gameState):
+            matrix[capsule[0], capsule[1]] = enemycapsulecolor
+
+        for eaten_stuff in self.checkEatenFoodAndCapsules(
+            gameState, self.last_turn_state
+        ):
+            matrix[eaten_stuff[0], eaten_stuff[1]] = enemycolor
+
+        return matrix
+
+    def convert_gamestate(self, gameState: GameState) -> np.ndarray:
+        """
+        Converts the gamestate to a numpy array, representing our world model.
+        """
+        matrix = self.make_vision_matrix(gameState)
+        matrix = matrix.astype(np.float32) / 255
+        return matrix
+
+    def isVulnerable(self, gameState: GameState, index: int):
+        enemy_index = self.getOpponents(gameState)[0]
+        if self.checkIsScared(gameState, index):
+            return True
+        elif self.checkIsPacman(gameState, index) and not self.checkIsScared(
+            gameState, enemy_index
+        ):
+            return True
+        else:
+            return False
+
+    def checkEatenFoodAndCapsules(
+        self, gameState: GameState, last_turn_state: GameState
+    ):
+        now_food = self.getFoodYouAreDefending(gameState).asList()
+        previous_food = self.getFoodYouAreDefending(last_turn_state).asList()
+        previous_capsules = self.getCapsulesYouAreDefending(last_turn_state)
+        now_capsules = self.getCapsulesYouAreDefending(gameState)
+        eaten_capsules = list(set(previous_capsules) - set(now_capsules))
+        eaten_food = list(set(previous_food) - set(now_food))
+        return eaten_food + eaten_capsules
+
+    def checkIsScared(self, gameState: GameState, index: int):
+        return gameState.getAgentState(index).scaredTimer > 0
+
+    def checkIsPacman(self, gameState: GameState, index: int):
+        return gameState.getAgentState(index).isPacman
+
+    def learn_step(self):
+        """
+        Use a batch from the buffer to update the policy
+        """
+        batch = self.buffer.sample(self.batch_size)
+        images = torch.tensor(np.array(batch)).to(self.device).permute(0, 3, 1, 2)
+        # print(images.shape)
+
+        # Compute the estimated values
+        reconstructed = self.AE(images)
+
+        loss = self.loss(images, reconstructed)
+        self.optimizer.zero_grad()
+        loss.backward()
+
+        # prevent exploding gradients
+        self.optimizer.step()
+        if USE_WANDB:
+            fig, ax = plt.subplots(1, 2)
+            ax[0].imshow(images[0].cpu().permute(1, 2, 0).detach().numpy())
+            ax[1].imshow(reconstructed[0].cpu().permute(1, 2, 0).detach().numpy())
+            plt.tight_layout()
+            # plt.show()
+            wandb.log({"loss": loss.item()})
+            wandb.log({"reconstructed": fig})
+            plt.close(fig)
+
+        self.step += 1
 
 
 class NNTrainingAgent(CaptureAgent):
@@ -384,7 +576,7 @@ class NNTrainingAgent(CaptureAgent):
         score = distance / self.MAX_DIST
         return -1 / (score + 1)
 
-    def make_CNN_input(self, gameState: GameState, desired_size=(64, 128)):
+    def make_CNN_input(self, gameState: GameState, desired_size=(96, 192)):
         observation = self.convert_gamestate(gameState)
         observation = self.upscale_matrix(observation, desired_size=desired_size)
         return observation
@@ -595,10 +787,9 @@ class NNTrainingAgent(CaptureAgent):
         )
         if len(food_distances) < 65:
             obs += food_distances
-            obs += [1] * (10 - len(food_distances))
+            obs += [1] * (65 - len(food_distances))
         else:
             obs += food_distances[:65]
-        print(len(obs))
         # distance to powerup
         capsules = self.getCapsules(gameState)
         if len(capsules) > 0:
@@ -606,7 +797,6 @@ class NNTrainingAgent(CaptureAgent):
             obs.append(dist / self.MAX_DIST)
         else:
             obs.append(1)
-        print(len(obs))
         # distance to teaammate
         for ally in self.getTeam(gameState):
             if ally != self.index:
@@ -616,7 +806,6 @@ class NNTrainingAgent(CaptureAgent):
                     obs.append(dist / self.MAX_DIST)
                 else:
                     obs.append(1)
-        print(len(obs))
         # distance to enemies
         for enemy in self.getOpponents(gameState):
             if enemy != self.index:
@@ -629,18 +818,17 @@ class NNTrainingAgent(CaptureAgent):
                     dist = gameState.getAgentDistances()[enemy]
                     dist = max(0, dist)
                     obs.append(dist / self.MAX_DIST)
-        print(len(obs))
         # is scared
         obs.append(int(self.checkIsScared(gameState, self.index)))
         # is pacman
         obs.append(int(self.checkIsPacman(gameState, self.index)))
-        print(len(obs))
         # check if we can go up, down, left, right
         obs.append(int(self.checkCanGoUp(gameState, self.index)))
         obs.append(int(self.checkCanGoDown(gameState, self.index)))
         obs.append(int(self.checkCanGoLeft(gameState, self.index)))
         obs.append(int(self.checkCanGoRight(gameState, self.index)))
-        print(len(obs))
+        if len(obs) != 75:
+            print(len(obs))
         obs_array = np.array(obs, dtype=np.float32)
         return obs_array
 
@@ -1029,7 +1217,7 @@ class NNPlayingAgent(CaptureAgent):
 
     def chooseAction(self, gameState: GameState):
         observation = self.convert_gamestate(gameState)
-        upscaled_observation = self.upscale_matrix(observation, desired_size=(64, 128))
+        upscaled_observation = self.upscale_matrix(observation, desired_size=(96, 192))
         # plt.imshow(upscaled_observation)
         # plt.imsave("test.png", upscaled_observation)
         # plt.show()
