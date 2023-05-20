@@ -353,6 +353,29 @@ class NNTrainingAgent(CaptureAgent):
 
     def count_food(self, gameState: GameState):
         return len(self.getFood(gameState).asList())
+    
+    def isGameOver(self, gameState: GameState):
+        print("timeLeft: ", gameState.data.timeleft)
+        if gameState.isOver():
+            print ("gameState.isOver(): ", gameState.isOver())
+            input()
+        # if game.gameOver:
+        #     print ("game.gameOver: ", game.gameOver)
+        if gameState.data._win:
+            print ("gameState.data._win: ", gameState.data._win)
+            input()
+        if gameState.data._lose:
+            print ("gameState.data._lose: ", gameState.data._lose)
+            input()
+        # if gameState.isWin():
+        #     print ("isWin: ", gameState.isWin())
+        # if gameState.isLose():
+        #     print("isLose: ", gameState.isLose())
+        # if game.state.isWin():
+        #     print ("isWin2" , game.state.isWin())
+        # if game.state.isLose():
+        #     print ("isLose2" , game.state.isLose())
+        return gameState.isOver()
 
     def distance_to_start_reward(self, gameState: GameState):
         distance = self.getMazeDistance(
@@ -367,6 +390,7 @@ class NNTrainingAgent(CaptureAgent):
         return observation
 
     def chooseAction(self, gameState: GameState):
+        isGameOver = self.isGameOver(gameState)
         self.step += 1
         self.game_step += 1
 
@@ -413,7 +437,7 @@ class NNTrainingAgent(CaptureAgent):
             self.last_turn_observation,
             reward,
             observation,
-            gameState.isOver(),
+            False, #gameState.isOver(),
         )
         if gameState.isOver():
             print("Game over")
