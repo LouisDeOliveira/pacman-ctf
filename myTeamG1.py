@@ -489,7 +489,7 @@ class NNTrainingAgent(CaptureAgent):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy.to(self.device)
         self.target.to(self.device)
-        # self.load_weights("./policy_450.pt", "./target_450.pt")
+        self.load_weights("./policy_900_CNN.pt", "./target_900_CNN.pt")
         self.refoffensiveagent = OffensiveReflexAgent(self.index)
         self.refdefensiveagent = DefensiveReflexAgent(self.index)
         print("device: ", self.device)
