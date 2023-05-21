@@ -31,7 +31,7 @@ from captureAgents import CaptureAgent
 from distanceCalculator import manhattanDistance
 from game import Directions
 
-USE_WANDB = True
+USE_WANDB = False
 
 if USE_WANDB:
     import wandb
@@ -206,7 +206,7 @@ def createTeam(
     firstIndex,
     secondIndex,
     isRed,
-    first="NNTrainingAgent",
+    first="NNPlayingAgent",
     second="DefensiveReflexAgent",
     numTraining=0,
 ):
@@ -1137,19 +1137,21 @@ class NNPlayingAgent(CaptureAgent):
         self.action_names = {v: k for k, v in self.action_numbers.items()}
         self.policy = CNNPolicy().to(self.device)
         self.policy.load_state_dict(
-            torch.load("./policy_100.pt", map_location=self.device)
+            torch.load("./final_policy_5000_CNN.pt", map_location=self.device)
         )
 
     def registerInitialState(self, gameState: GameState):
         """
         Do init stuff in here :)
         """
+        self.game_steps = 0
         # print("I am agent " + str(self.index))
         # print("Total reward from last game: " + str(self.total_reward))
         self.map_size = gameState.data.layout.width, gameState.data.layout.height
         self.last_turn_state = gameState
         self.refoffensiveagent = OffensiveReflexAgent(self.index)
         CaptureAgent.registerInitialState(self, gameState)
+        self.refoffensiveagent.registerInitialState(gameState)
 
     def action_masking(self, raw_action_values: torch.Tensor, gameState: GameState):
         legal_actions = gameState.getLegalActions(self.index)
@@ -1258,6 +1260,12 @@ class NNPlayingAgent(CaptureAgent):
             return True
 
     def chooseAction(self, gameState: GameState):
+        self.game_steps += 1
+        if self.game_steps < 75:
+            return self.refoffensiveagent.chooseAction(gameState)
+        
+        if random.random() < 0.1:
+            return self.refoffensiveagent.chooseAction(gameState)
         observation = self.convert_gamestate(gameState)
         upscaled_observation = self.upscale_matrix(observation, desired_size=(48, 96))
         # plt.imshow(upscaled_observation)
