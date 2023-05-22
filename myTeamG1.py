@@ -489,7 +489,7 @@ class NNTrainingAgent(CaptureAgent):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy.to(self.device)
         self.target.to(self.device)
-        self.load_weights("./policy_900_CNN.pt", "./target_900_CNN.pt")
+        #self.load_weights("./Backups/policy_7800_CNN.pt", "./Backups/target_7800_CNN.pt")
         self.refoffensiveagent = OffensiveReflexAgent(self.index)
         self.refdefensiveagent = DefensiveReflexAgent(self.index)
         print("device: ", self.device)
@@ -1137,7 +1137,7 @@ class NNPlayingAgent(CaptureAgent):
         self.action_names = {v: k for k, v in self.action_numbers.items()}
         self.policy = CNNPolicy().to(self.device)
         self.policy.load_state_dict(
-            torch.load("./final_policy_5000_CNN.pt", map_location=self.device)
+            torch.load("./final_policy_7800_CNN.pt", map_location=self.device) #NOTE:FOR PLAYING
         )
 
     def registerInitialState(self, gameState: GameState):
